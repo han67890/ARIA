@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aria-rag"
+version = "0.1.0"
+description = "ARIA: Score- and Memory-Conditioned Retrieval and Compression for Latent-Compression Retrieval-Augmented Generation"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "AML AND Apache-2.0 AND CC-BY-NC-4.0"
+license-files = ["LICENSE", "LICENSES/*", "NOTICE", "ACKNOWLEDGEMENTS"]
+authors = [{name = "Yiheng Han"}]
+keywords = [
+  "retrieval-augmented generation",
+  "context compression",
+  "information retrieval",
+  "natural language processing",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.3.1,<2.4",
+  "numpy>=1.24,<2",
+  "transformers>=4.43,<4.44",
+  "peft>=0.11,<0.12",
+  "huggingface-hub>=0.24,<0.25",
+  "datasets>=2.19,<2.20",
+  "pyarrow>=16,<17",
+  "jinja2>=3.1",
+  "requests>=2.31",
+  "safetensors>=0.4,<0.5",
+  "sentencepiece>=0.2,<0.3",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+retrieval = [
+  "sentence-transformers>=3.0,<3.1",
+  "spacy>=3.7,<3.8",
+  "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl",
+]
+train = [
+  "accelerate>=0.30,<0.31",
+  "deepspeed==0.14.0; platform_system == 'Linux'",
+  "wandb>=0.17,<0.18",
+]
+dev = [
+  "build>=1.2",
+  "pytest>=8.2",
+  "ruff>=0.6",
+  "twine>=5.1",
+]
+
+[project.scripts]
+aria-data = "openrlhf.cli.aria_data:main"
+aria-train = "openrlhf.cli.train_sft:main"
+aria-infer = "openrlhf.cli.infer_aria:main"
+aria-evaluate = "openrlhf.cli.evaluate_aria:main"
+aria-ablate = "openrlhf.cli.ablation_aria:main"
+aria-counterfactual = "openrlhf.cli.counterfactual_decomposition:main"
+aria-build-bge = "openrlhf.cli.build_bge_artifacts:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["openrlhf*"]
+
+[tool.setuptools.package-data]
+openrlhf = ["configs/*.json"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = ["evaluation/evaluation_data", "clara_archives", "tmp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["integration: requires model/data artifacts or an accelerator"]

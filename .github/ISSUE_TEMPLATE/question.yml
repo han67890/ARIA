@@ -1,0 +1,23 @@
+name: Reproduction question
+description: Ask about setup, artifacts, or the documented paper protocol
+title: "[Question] "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Check README.md and docs/reproducibility.md first. Do not include
+        credentials, private data, or access tokens.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Explain what you are trying to reproduce and where you are blocked.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Environment and protocol context
+      description: Include commit, platform, stage, ratio, command, and sanitized logs.
+    validations:
+      required: true

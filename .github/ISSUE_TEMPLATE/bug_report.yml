@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a reproducible ARIA implementation problem
+title: "[Bug] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction_context
+    attributes:
+      label: Reproduction context
+      description: Include commit, platform, stage, compression ratio, and artifact schemas. Do not include secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Minimal reproduction
+      description: Provide a minimal command or code sample and sanitized logs.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Artifact provenance
+      description: List model revisions and artifact schema/hash metadata when relevant.

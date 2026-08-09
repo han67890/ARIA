@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a scoped ARIA implementation or tooling improvement
+title: "[Feature] "
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Describe the use case or paper-protocol gap.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Explain the expected behavior and affected component.
+    validations:
+      required: true
+  - type: dropdown
+    id: alignment
+    attributes:
+      label: Protocol relationship
+      options:
+        - Reproduces the current ARIA paper protocol
+        - Backward-compatible tooling or documentation
+        - Intentional research extension (must be labeled separately)
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: List tests, artifacts, or comparisons that would validate it.
+    validations:
+      required: true

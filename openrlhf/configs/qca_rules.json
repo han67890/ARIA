@@ -1,0 +1,52 @@
+{
+  "source": "ARIA Appendix Tables A51-A52",
+  "entity_types": ["PERSON", "ORG", "GPE", "LOC", "FAC", "EVENT", "PRODUCT", "WORK_OF_ART"],
+  "classification": {
+    "multi_hop": "any hop indicator",
+    "multi_aspect": "any aspect indicator and no assigned hop indicator",
+    "simple": "otherwise",
+    "conflict_precedence": ["multi_hop", "multi_aspect", "simple"]
+  },
+  "rules": [
+    {"id": "H01", "category": "multi_hop", "weight": 1.0, "condition": "entity_count >= 3"},
+    {"id": "H02", "category": "multi_hop", "weight": 1.0, "condition": "contains in which country/city/state/year"},
+    {"id": "H03", "category": "multi_hop", "weight": 0.9, "condition": "contains born in the same/headquartered in the/located in the same"},
+    {"id": "H04", "category": "multi_hop", "weight": 0.9, "condition": "contains who invented/founded/directed/wrote/discovered; entity_count >= 2 resolves H04 vs S03"},
+    {"id": "H05", "category": "multi_hop", "weight": 0.9, "condition": "contains where was ... born/where did ... die/where is ... headquartered"},
+    {"id": "H06", "category": "multi_hop", "weight": 0.85, "condition": "entity_count == 2 and contains that/which/whose/where"},
+    {"id": "H07", "category": "multi_hop", "weight": 0.85, "condition": "nested the {ENTITY} of {ENTITY}"},
+    {"id": "H08", "category": "multi_hop", "weight": 0.8, "condition": "contains same {noun} as/the same ... as"},
+    {"id": "H09", "category": "multi_hop", "weight": 0.8, "condition": "contains also known as/formerly known as/previously called"},
+    {"id": "H10", "category": "multi_hop", "weight": 0.75, "condition": "starts what is the ... of the {ENTITY} that"},
+    {"id": "H11", "category": "multi_hop", "weight": 0.75, "condition": "contains after/before {ENTITY} {verb}"},
+    {"id": "H12", "category": "multi_hop", "weight": 0.7, "condition": "contains the {superlative} ... in the {ENTITY}"},
+    {"id": "H13", "category": "multi_hop", "weight": 0.65, "condition": "entity_count == 2 and what/who/when/where question with transitive verb"},
+    {"id": "H14", "category": "multi_hop", "weight": 0.6, "condition": "contains through which/via which/by means of which"},
+
+    {"id": "A01", "category": "multi_aspect", "weight": 1.0, "condition": "starts compare/what are the differences between/contrast"},
+    {"id": "A02", "category": "multi_aspect", "weight": 1.0, "condition": "contains advantages and disadvantages/pros and cons/benefits and drawbacks"},
+    {"id": "A03", "category": "multi_aspect", "weight": 0.9, "condition": "both ... and .../either ... or ... with two distinct entities"},
+    {"id": "A04", "category": "multi_aspect", "weight": 0.9, "condition": "contains difference/similarities/relationship between"},
+    {"id": "A05", "category": "multi_aspect", "weight": 0.85, "condition": "contains list/enumerate/name all/give examples of"},
+    {"id": "A06", "category": "multi_aspect", "weight": 0.85, "condition": "contains how does ... compare to/how is ... different from"},
+    {"id": "A07", "category": "multi_aspect", "weight": 0.8, "condition": "contains what are the main/key/primary followed by plural aspect noun"},
+    {"id": "A08", "category": "multi_aspect", "weight": 0.75, "condition": "contains in terms of/with respect to/regarding ... and ..."},
+    {"id": "A09", "category": "multi_aspect", "weight": 0.75, "condition": "contains as well as/in addition to with entity_count >= 2"},
+    {"id": "A10", "category": "multi_aspect", "weight": 0.7, "condition": "multiple/various/several {plural noun}"},
+    {"id": "A11", "category": "multi_aspect", "weight": 0.65, "condition": "contains what factors/aspects/characteristics"},
+    {"id": "A12", "category": "multi_aspect", "weight": 0.6, "condition": "contains overview of/describe the ... of/explain the {noun} and the {noun}"},
+
+    {"id": "S01", "category": "simple", "weight": 1.0, "condition": "entity_count == 1 and starts what is/who is/when is"},
+    {"id": "S02", "category": "simple", "weight": 1.0, "condition": "entity_count == 1 and starts when was/where was/how many"},
+    {"id": "S03", "category": "simple", "weight": 0.9, "condition": "entity_count == 1 and starts who wrote/who invented"},
+    {"id": "S04", "category": "simple", "weight": 0.9, "condition": "starts what year/what date/in what year/how old is"},
+    {"id": "S05", "category": "simple", "weight": 0.85, "condition": "contains the capital/population/president of"},
+    {"id": "S06", "category": "simple", "weight": 0.85, "condition": "entity_count == 0 and contains factoid verb is/was/are/were"},
+    {"id": "S07", "category": "simple", "weight": 0.8, "condition": "starts what is the name of the/who is the current"},
+    {"id": "S08", "category": "simple", "weight": 0.8, "condition": "contains the birthplace/nationality/height of"},
+    {"id": "S09", "category": "simple", "weight": 0.75, "condition": "starts how tall/long/far/deep/wide"},
+    {"id": "S10", "category": "simple", "weight": 0.7, "condition": "starts what language/currency/color/type of"},
+    {"id": "S11", "category": "simple", "weight": 0.65, "condition": "entity_count == 1 and no bridge/comparative/superlative"},
+    {"id": "S12", "category": "simple", "weight": 0.6, "condition": "fallback when no hop or aspect indicator fires"}
+  ]
+}

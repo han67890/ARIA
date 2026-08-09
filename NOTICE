@@ -1,0 +1,28 @@
+ARIA is a modified research implementation derived from Apple ml-clara:
+https://github.com/apple/ml-clara
+
+The inherited CLaRa files retain their Apple copyright headers and are
+distributed under the accompanying LICENSE (SPDX: AML). This repository also
+contains code derived from or built on OpenRLHF and material identified by the
+upstream distribution as PISCO-derived. See ACKNOWLEDGEMENTS for third-party
+attribution and applicable terms.
+
+Original ARIA additions:
+
+Copyright 2026 Yiheng Han
+
+Original ARIA additions for which the named copyright holder owns the relevant
+rights are licensed under the Apache License, Version 2.0, reproduced in
+LICENSES/Apache-2.0.txt. This grant does not relicense inherited Apple CLaRa,
+OpenRLHF, PISCO, dataset, model, or other third-party material. Files combining
+inherited and original material remain subject to every applicable term.
+
+ARIA is an independent research extension and is not sponsored or endorsed by
+Apple Inc., Naver Labs Europe, or the OpenRLHF authors.
+
+The retained upstream evaluation archives contain evaluation records from NQ
+(CC BY-SA 3.0), HotpotQA (CC BY-SA 4.0), MuSiQue (CC BY 4.0), and
+2WikiMultiHopQA (Apache 2.0), as identified in ARIA.pdf Appendix A.37. Full
+training pools, the KILT corpus, embeddings, model weights, and generated
+MuSiQue augmentation artifacts are obtained from their respective providers
+under their applicable terms.
