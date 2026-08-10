@@ -218,7 +218,7 @@ websockets==15.0.1
 xformers==0.0.27
 xgrammar==0.1.25
 xxhash==3.6.0
-yarl==1.22.0
+yarl==1.24.5
 zipp==3.23.0
 # flash-attn==2.5.9.post1  install separately with --no-build-isolation
 
