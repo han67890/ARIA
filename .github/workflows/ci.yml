@@ -20,10 +20,10 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Verify bundled manuscript
         run: test -f ARIA.pdf
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
