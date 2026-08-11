@@ -36,8 +36,8 @@ history or grant additional distribution rights.
   worktree, package artifacts, or any history intended for publication. Test
   matched CLaRa with an explicit `--clara_archive_dir` and the pinned digests
   in `docs/evaluation.md`.
-- Confirm that the bundled `ARIA.pdf` is byte-identical to the release
-  manuscript and that citation metadata describes that version.
+- Confirm that citation metadata describes the current manuscript version and
+  add its archival URL or DOI when one becomes available.
 
 ## Release verification
 

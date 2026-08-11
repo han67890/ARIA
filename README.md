@@ -4,7 +4,6 @@
 
 ### Score- and Memory-Conditioned Retrieval and Compression for Latent-Compression Retrieval-Augmented Generation
 
-[![Paper](https://img.shields.io/badge/paper-PDF-b31b1b.svg)](ARIA.pdf)
 [![Python](https://img.shields.io/badge/python-3.10%E2%80%933.11-3776ab.svg)](pyproject.toml)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-mixed%20AML%20%2B%20Apache--2.0%20%2B%20CC--BY--NC--4.0-lightgrey.svg)](#license-and-attribution)
@@ -89,7 +88,6 @@ packaging, tests, and CI added:
 │   └── utils/
 ├── scripts/                 # one canonical set of paper protocol launchers
 ├── tests/                   # deterministic CPU tests
-├── ARIA.pdf
 ├── LICENSE / NOTICE / ACKNOWLEDGEMENTS
 ├── pyproject.toml
 └── requirements.txt         # reconciled Linux/CUDA 12.1 environment

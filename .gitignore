@@ -58,6 +58,7 @@ tmp/
 *.index
 
 # LaTeX build products
+/ARIA.pdf
 *.aux
 *.bbl
 *.blg

@@ -1,5 +1,4 @@
 include README.md
-include ARIA.pdf
 include LICENSE
 recursive-include LICENSES *.txt *.md
 include NOTICE
