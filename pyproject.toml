@@ -7,7 +7,7 @@ name = "aria-rag"
 version = "0.1.0"
 description = "ARIA: Score- and Memory-Conditioned Retrieval and Compression for Latent-Compression Retrieval-Augmented Generation"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.12"
 license = "AML AND Apache-2.0 AND CC-BY-NC-4.0"
 license-files = ["LICENSE", "LICENSES/*", "NOTICE", "ACKNOWLEDGEMENTS"]
 authors = [{name = "Yiheng Han"}]
@@ -24,7 +24,6 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -41,6 +40,10 @@ dependencies = [
   "sentencepiece>=0.2,<0.3",
   "tqdm>=4.66",
 ]
+
+[project.urls]
+Repository = "https://github.com/han67890/ARIA"
+Issues = "https://github.com/han67890/ARIA/issues"
 
 [project.optional-dependencies]
 retrieval = [

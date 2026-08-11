@@ -19,10 +19,10 @@ checkpoints.
 - Keep the Phase-II page-URL-deduplicated training corpus/index separate from
   the complete KILT corpus/index used for Normal evaluation.
 
-The manuscript currently contains a placeholder rather than a public archival
-repository URL and does not state the historical Hub commit IDs. A reproducer
-must obtain these values from the release owner; this repository does not guess
-them.
+The canonical source repository is
+<https://github.com/han67890/ARIA>. The manuscript and repository do not state
+the historical Hub commit IDs used for the reported runs. A reproducer must
+obtain those values from the release owner; this repository does not guess them.
 
 ## 2. Verify the method contract
 

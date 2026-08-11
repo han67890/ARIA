@@ -5,11 +5,14 @@
 ### Score- and Memory-Conditioned Retrieval and Compression for Latent-Compression Retrieval-Augmented Generation
 
 [![Paper](https://img.shields.io/badge/paper-PDF-b31b1b.svg)](ARIA.pdf)
-[![Python](https://img.shields.io/badge/python-3.10%E2%80%933.12-3776ab.svg)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.10%E2%80%933.11-3776ab.svg)](pyproject.toml)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-mixed%20AML%20%2B%20Apache--2.0%20%2B%20CC--BY--NC--4.0-lightgrey.svg)](#license-and-attribution)
 
 </div>
+
+**Author:** Yiheng Han, University of Electronic Science and Technology of China<br>
+**Code:** [github.com/han67890/ARIA](https://github.com/han67890/ARIA)
 
 ARIA is an end-to-end latent-compression retrieval-augmented generation system.
 It extends [Apple CLaRa](https://github.com/apple/ml-clara) with a five-stage
@@ -97,6 +100,8 @@ packaging, tests, and CI added:
 ### Linux/NVIDIA installation
 
 ```bash
+git clone https://github.com/han67890/ARIA.git
+cd ARIA
 conda create -n aria python=3.10 -y
 conda activate aria
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 \
@@ -109,6 +114,9 @@ The repository has one requirements file; `pyproject.toml` separately keeps the
 package metadata and bounded direct dependencies. The packaged Linux stack is
 reconciled around CUDA 12.1, PyTorch 2.3.1, DeepSpeed 0.14.0, Transformers
 4.43.3, and `vllm==0.5.3.post1`.
+The full paper-training environment targets Python 3.10. Lightweight package
+and CI checks support Python 3.10 and 3.11; Python 3.12 is not claimed as a
+supported environment.
 
 The current manuscript does not pin Python-library versions or training
 hardware. These are release-engineering choices for this repository and must
@@ -308,12 +316,13 @@ protocol or artifact schema are also called out explicitly in
              for Latent-Compression Retrieval-Augmented Generation},
   year    = {2026},
   version = {0.1.0},
+  url     = {https://github.com/han67890/ARIA},
   note    = {Research code and accompanying manuscript}
 }
 ```
 
-Add the archival repository URL and paper DOI to the citation record when they
-become public; neither is invented in this snapshot.
+Add the paper DOI to the citation record when one becomes available; no DOI is
+invented in this snapshot.
 
 ## License and attribution
 

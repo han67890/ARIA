@@ -9,6 +9,12 @@ called out even when they remain backward-compatible at the API level.
 
 ### Changed
 
+- Added the canonical public repository URL and author affiliation to citation
+  metadata, documentation, and the bundled manuscript.
+- Narrowed lightweight package/CI support to Python 3.10--3.11 after the Python
+  3.12 test job failed; the full paper-training environment remains Python 3.10.
+- Added a CI guard that requires the release manuscript `ARIA.pdf` to be
+  present in the repository root.
 - Corrected package licensing to the mixed SPDX expression
   `AML AND Apache-2.0 AND CC-BY-NC-4.0`, retained upstream notices, and scoped
   Apache-2.0 solely to original ARIA additions owned by their copyright holder.

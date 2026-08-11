@@ -8,7 +8,9 @@ type: software
 authors:
   - family-names: Han
     given-names: Yiheng
+    affiliation: University of Electronic Science and Technology of China
 version: 0.1.0
+repository-code: https://github.com/han67890/ARIA
 preferred-citation:
   type: article
   title: >-
@@ -17,5 +19,6 @@ preferred-citation:
   authors:
     - family-names: Han
       given-names: Yiheng
+      affiliation: University of Electronic Science and Technology of China
   year: 2026
-  notes: Manuscript included as ARIA.pdf; archival URL and DOI pending.
+  notes: Manuscript included as ARIA.pdf; DOI pending.

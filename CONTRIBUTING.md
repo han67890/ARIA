@@ -5,7 +5,8 @@ documentation, and tests are welcome.
 
 ## Development setup
 
-Use Python 3.10--3.12 for source-level checks:
+Use Python 3.10--3.11 for source-level checks. The full paper-training stack
+targets Python 3.10:
 
 ```bash
 python -m venv .venv

@@ -19,8 +19,9 @@ Transformers 4.43.3, and `vllm==0.5.3.post1`. FlashAttention is installed in the
 final step with `--no-build-isolation`.
 
 The current manuscript does not report exact library versions or a hardware
-model. Treat the versions above as the repository's tested release stack, not
-as manuscript hyperparameters. Full runs additionally require appropriately
+model. Treat the versions above as the repository's pinned, intended release
+environment, not as manuscript hyperparameters or evidence of a fully validated
+GPU stack. Full runs target Python 3.10 and additionally require appropriately
 sized NVIDIA accelerators, the pinned base model, fixed corpus/BGE vectors, and
 prepared paper datasets. The spaCy English model and development checks are in
 the same dependency file.

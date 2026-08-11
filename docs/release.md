@@ -17,8 +17,9 @@ history or grant additional distribution rights.
 - Run a credential scanner over both the worktree and the complete release
   history. Rotate any real credential that was ever committed; rewriting
   history is not a substitute for rotation.
-- Set the canonical repository URL, then replace the manuscript/CITATION
-  placeholders and add the archival DOI when one exists.
+- Verify that the manuscript and citation metadata use the canonical repository
+  URL, <https://github.com/han67890/ARIA>, and add an archival DOI when one
+  exists.
 
 ## Rights and third-party artifacts
 
