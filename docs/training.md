@@ -44,6 +44,12 @@ are 2,048/512 tokens. The passage maximum is 768 tokens. LoRA targets only
 `q_proj`, with rank 16, alpha 32, dropout 0.10, Kaiming-uniform `A`, and zero
 `B`.
 
+Both Phase-I conditional generation and Phase-II answer generation use the
+exact mean next-token cross-entropy over unmasked target positions in the
+physical data-parallel minibatch. Rank-local means are rescaled from the
+data-parallel target-token count before DeepSpeed gradient averaging. The
+official launchers use one physical minibatch per optimizer step.
+
 `BASE_MODEL_REVISION` is forwarded to the decoder and tokenizer; their
 resolved commits must agree and are persisted in the checkpoint. Use the same
 value for Phase II. A tag or branch is accepted, but an exact commit is the
@@ -60,19 +66,19 @@ bash scripts/train_phase2.sh 16 checkpoints/aria_phase1_seed42_cr16 42
 ```
 
 Full ARIA Phase II executes both retrieval rounds in every batch and optimizes
-the complete Equation 3 objective:
+the paper objective:
 
 ```text
-L = L_QA + 0.10 L_MSE + 0.10 L_CFRS + 0.05 L_QR + 0.05 L_MTFRL
+L = L_QA + 0.10 L_MSE
 ```
 
 `L_MSE` is the coordinate-wise squared distance between the sequence means of
 valid memory-token and query/gold-answer hidden states in the final
 teacher-forced QA decoder layer. It is symmetric: gradients reach both means.
-`L_CFRS` trains the compressor through the frozen decoder's teacher-forced
-proxy pass; `L_QR` trains the QR adapter through fixed `W_BGE`; and `L_MTFRL`
-trains the feedback projection and soft memory path. Examples without support
-annotations still contribute to QA, MSE, and CFRS.
+The forward pass uses the exact hard document sets produced by retrieval and
+ranking. Identity-valued straight-through cosine factors on selected documents
+preserve those forward values while exposing gradients from QA/MSE to the QR
+adapter and `P_fb`. No retrieval-specific auxiliary loss is added.
 
 Phase II trains independent QR/compressor/generator `q_proj` LoRA adapters and
 all parameters of `P_fb`. The compressor loads the corresponding Phase-I
@@ -89,6 +95,11 @@ The Phase-II input/target maxima are 1,024/128 tokens; passage/query maxima are
 normalized projected QR state and frozen BGE document embeddings as the dense
 retrieval path; no separate MiniLM model or semantic index belongs to the
 paper protocol.
+
+The main model uses soft ACR gates during training and hard thresholded gates
+at inference. To train the hard-gate analysis checkpoint with the same forward
+allocation and a sigmoid straight-through derivative, set
+`ACR_TRAINING_GATE=hard_st` when invoking `scripts/train_phase2.sh`.
 
 The default is the full paper model. QCA/AHR/IGFR/MADS/CCEF ablations are
 fixed-checkpoint inference interventions: evaluate each label with the
@@ -130,11 +141,11 @@ candidates to the trained selector.
 Training supports `full`, `clara_baseline`, and the four independently
 retrained 16x coupling controls: `remove_cfrs`,
 `uniform_acr`, `static_second_retrieval`, and `remove_all_coupling`.
-`remove_cfrs` sets only lambda_CFRS to zero. `uniform_acr` replaces adaptive
-scores with a score-independent 108-token target. `static_second_retrieval`
-keeps D2=200 and union -> MADS -> CCEF but uses the static QR/W_BGE query and
-sets lambda_MTFRL to zero. `remove_all_coupling` combines those three changes
-while retaining QA, LMSE, and QR losses. All four use the same Phase-I
+`remove_cfrs` omits the fidelity reranking operation. `uniform_acr` replaces
+adaptive scores with a score-independent 108-token target.
+`static_second_retrieval` keeps D2=200 and union -> MADS -> CCEF but uses the
+static QR/W_BGE query. `remove_all_coupling` combines those three changes. All
+four use the same two-term training objective, Phase-I
 initialization, Phase-II data/schedule/seeds, D1 construction and final document
 ceiling as matched full.
 
@@ -145,11 +156,11 @@ it disables CFRS, uses rho=1/full retention, and omits the second round. This is
 the paper's 184-token fixed-checkpoint sensitivity row, not the separately
 retrained 108-token `remove_all_coupling` row.
 
-The manuscript does not uniquely specify per-example uniform rounding or the
-static query. The versioned release convention is
+The versioned release convention for per-example uniform rounding and the
+static query is
 `min(1, 108 / sum(real K0))` for every real document and the original QR state
-after frozen W_BGE for static D2. These fields, their inferred-status flag, and
-the effective zero/nonzero loss weights are serialized in `config.json`.
+after frozen W_BGE for static D2. These fields and the effective loss weight
+are serialized in `config.json`.
 
 `scripts/train_all_cr.sh` expands the five paper compression ratios and five
 independent run seeds `{42, 123, 456, 789, 2024}` for ARIA. Matched CLaRa needs
@@ -162,20 +173,12 @@ actual hardware used for every reproduced run.
 
 ### CFRS
 
-CFRS consumes the final ACR-processed memory actually sent to the generator.
-With the generator LoRA disabled, the frozen base decoder is teacher-forced on
-the original passage after the fixed instruction:
-
-> Reconstruct the original passage from the memory tokens. Output only the
-> reconstructed passage.
-
-For each non-padding, non-delimiter passage target, CFRS sums the squared error
-between the predicted vocabulary probability vector and the one-hot next-token
-target, then averages over valid tokens. The undetached per-document error
-enters `L_CFRS`; a detached reverse-min--max copy (tie fallback `0.5`, epsilon
-`1e-6`) is blended with CCEF at weight `0.30` for hard stable ordering. This is
-a next-token probability proxy, not latent cross-attention or hidden-state
-reconstruction.
+CFRS consumes each final passage's ACR-processed memory and the valid
+non-memory states from the same compressor pass. It computes the coordinate
+mean squared distance between the two sequence means. A detached reverse
+min--max transform (tie fallback `0.5`, epsilon `1e-6`) is blended with CCEF at
+weight `0.30` for stable ordering. CFRS is a ranking statistic, not a Phase-II
+loss term.
 
 ### MTFRL
 
@@ -191,10 +194,11 @@ Qwen-2.5-14B:          5120 -> 2560 -> 1024
 ```
 
 Its weights are Xavier-uniform and biases are zero; the paper does not specify
-an SVD-based initialization. The L2-normalized output is trained with a
-temperature-0.05 supporting-passage contrastive loss. A detached copy performs
-exactly one BGE search for 200 documents; `D1 union D2` is then reranked by
-MADS and CCEF.
+an SVD-based initialization. The document-balanced pooled state is normalized
+before projection, and the projected output is normalized for cosine search.
+It performs exactly one BGE search for 200 documents; `D1 union D2` is then
+reranked by MADS and CCEF. During Phase II, an identity-valued selected-document
+cosine bridge supplies gradients from the two-term objective to this head.
 
 ### MADS and frozen retrieval state
 

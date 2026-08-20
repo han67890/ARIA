@@ -7,7 +7,6 @@
 
 import warnings
 import os
-from contextlib import contextmanager
 import torch
 import gc
 import time
@@ -55,7 +54,16 @@ IGNORE_INDEX = -100
 ARIA_NUMERICAL_EPSILON = 1e-6
 QR_INPUT_SCHEME = "native-tokenizer-final-token-v1"
 MTFRL_INITIALIZATION_SCHEME = "xavier-uniform-zero-bias-v1"
-CFRS_RECONSTRUCTION_SCHEME = "teacher-forced-squared-probability-v1"
+CFRS_FIDELITY_SCHEME = "hidden-mean-mse-v1"
+RETRIEVAL_STRAIGHT_THROUGH_SCHEME = "selected-document-cosine-identity-st-v1"
+ARIA_LIKELIHOOD_REDUCTION = "global-minibatch-target-token-mean-v1"
+ARIA_NO_COMPRESSION_CONFIGURATION = "no_compression"
+ARIA_NO_COMPRESSION_SCHEME = "first-pass-top5-raw-direct-context-v1"
+ARIA_NO_COMPRESSION_CONTEXT_POLICY = (
+    "no-truncation-fail-closed-at-model-or-32768-v1"
+)
+ARIA_NO_COMPRESSION_CONTEXT_CEILING = 32_768
+ARIA_NO_COMPRESSION_MAX_NEW_TOKENS = 64
 ORACLE_TOP100_PROTOCOL = "bge-top100-page-dedup-tail-inject-annotation-order-v2"
 CLARA_SELECTOR_SCHEME = "hard-forward-soft-backward-st-topk-v1"
 CLARA_DOCUMENT_REPRESENTATION_SCHEME = "frozen-variable-memory-masked-mean-v2"
@@ -71,10 +79,6 @@ UNIFORM_BUDGET_ALLOCATION_SCHEME = (
 STATIC_SECOND_QUERY_SCHEME = "original-qr-projected-by-frozen-w-bge-release-convention-v1"
 FIXED_UNIFORM_ALLOCATION_SCHEME = "score-independent-rho-0.625-v1"
 MATCHED_EVIDENCE_TOKEN_BUDGET = 108
-CFRS_RECONSTRUCTION_PREFIX = (
-    "Reconstruct the original passage from the memory tokens. Output only the "
-    "reconstructed passage."
-)
 
 
 def _mtfrl_hidden_width(input_dim: int, output_dim: int) -> int:
@@ -86,27 +90,24 @@ def _mtfrl_hidden_width(input_dim: int, output_dim: int) -> int:
     return input_dim // 2
 
 
-@contextmanager
-def _base_decoder_only(model: nn.Module):
-    """Temporarily disable every LoRA adapter while preserving memory gradients."""
-    singular = getattr(model, "disable_adapter", None)
-    if callable(singular):
-        context = singular()
-        if hasattr(context, "__enter__") and hasattr(context, "__exit__"):
-            with context:
-                yield
-            return
-    disable = getattr(model, "disable_adapters", None)
-    enable = getattr(model, "enable_adapters", None)
-    if not callable(disable) or not callable(enable):
-        raise RuntimeError(
-            "CFRS requires an adapter API that can expose the frozen base decoder"
-        )
-    disable()
-    try:
-        yield
-    finally:
-        enable()
+def _shifted_target_token_count(labels: torch.Tensor) -> torch.Tensor:
+    """Count causal-LM target positions after the decoder's one-token shift."""
+    if labels.ndim != 2 or labels.size(1) < 2:
+        raise ValueError("causal-LM labels must have shape (batch, sequence>=2)")
+    count = labels[:, 1:].ne(IGNORE_INDEX).sum()
+    if int(count.detach().item()) <= 0:
+        raise ValueError("causal-LM loss requires at least one shifted target token")
+    return count
+
+
+def _likelihood_outputs(
+    labels: torch.Tensor, **outputs: Any
+) -> Dict[str, Any]:
+    """Attach the shared likelihood-reduction interface to a forward result."""
+    if "target_token_count" in outputs:
+        raise ValueError("target_token_count is derived from labels")
+    outputs["target_token_count"] = _shifted_target_token_count(labels)
+    return outputs
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -145,6 +146,13 @@ _QCA_RULE_WEIGHTS: Dict[str, float] = {
 }
 _QCA_TOTAL_WEIGHT = sum(_QCA_RULE_WEIGHTS.values())
 _QCA_ENTITY_TYPES = set(_QCA_RULE_SPEC["entity_types"])
+# Appendix Tables A51--A52 distinguish the strongest explicit phrase families
+# from the remaining (partly count-driven) rules.  Resolve cross-category
+# conflicts by these tiers, not by a blanket "any H beats any A" rule.
+_QCA_EXPLICIT_HOP_RULES = frozenset({"H02", "H03", "H04", "H05"})
+_QCA_EXPLICIT_ASPECT_RULES = frozenset(
+    {"A01", "A02", "A03", "A04", "A05", "A06"}
+)
 _QCA_BRIDGE_CONNECTIVES = ("that", "which", "whose", "where")
 _QCA_COMPARATIVE_RE = re.compile(
     r"\b(?:same|different|difference|similar|compare|contrast|more|less|better|worse|"
@@ -514,10 +522,20 @@ class QuestionComplexityAssessor:
         fired = tuple(rule_id for rule_id in _QCA_RULE_WEIGHTS if matches[rule_id])
         hop_fired = [rule_id for rule_id in fired if rule_id.startswith("H")]
         aspect_fired = [rule_id for rule_id in fired if rule_id.startswith("A")]
+        explicit_hop_fired = [
+            rule_id for rule_id in hop_fired if rule_id in _QCA_EXPLICIT_HOP_RULES
+        ]
+        explicit_aspect_fired = [
+            rule_id for rule_id in aspect_fired if rule_id in _QCA_EXPLICIT_ASPECT_RULES
+        ]
 
-        # Explicit phrase rules and count rules have already been evaluated in
-        # table order.  Any hop rule wins a conflict; c(q) never affects routing.
-        if hop_fired:
+        # Exact conflict order: explicit H02--H05, explicit A01--A06, any
+        # remaining H, any remaining A, then Simple. c(q) is diagnostic only.
+        if explicit_hop_fired:
+            qtype = QuestionType.MULTI_HOP
+        elif explicit_aspect_fired:
+            qtype = QuestionType.MULTI_ASPECT
+        elif hop_fired:
             qtype = QuestionType.MULTI_HOP
         elif aspect_fired:
             qtype = QuestionType.MULTI_ASPECT
@@ -1576,6 +1594,7 @@ class RAGPipelineConfig:
     acr_min_token_ratio:     float = 0.25   # 最低分文档保留的 memory token 比例
     acr_max_token_ratio:     float = 1.0    # 最高分文档保留的 memory token 比例
     acr_sigmoid_beta:        float = 10.0
+    acr_training_gate:       str   = "soft"
     # Appendix A.26 analysis-only deployment mitigation; off for headline runs.
     use_128x_complexity_floor: bool = False
     acr_complexity_floor_128: float = 0.45
@@ -1583,7 +1602,6 @@ class RAGPipelineConfig:
     use_mtfrl:               bool  = True   # Memory Token Feedback Retrieval Loop
     second_retrieval_mode:   str   = "memory_feedback"
     mtfrl_second_top_k:      int   = 200    # 论文: D_2 第二轮检索返回 top-200 (line 834)
-    mtfrl_temperature:       float = 0.05
 
     def __post_init__(self) -> None:
         # Preserve the historical boolean constructor while making the actual
@@ -1599,6 +1617,8 @@ class RAGPipelineConfig:
                 "acr_allocation_mode must be adaptive, uniform_budget, "
                 "uniform_constant, or full"
             )
+        if self.acr_training_gate not in {"soft", "hard_st"}:
+            raise ValueError("acr_training_gate must be 'soft' or 'hard_st'")
         if self.second_retrieval_mode not in {
             "memory_feedback", "static_query", "disabled"
         }:
@@ -1722,6 +1742,8 @@ FIXED_CHECKPOINT_CONFIGURATIONS = frozenset({
 
 def required_checkpoint_configuration(runtime_configuration: str) -> str:
     """Resolve a runtime intervention to its immutable training label."""
+    if runtime_configuration == ARIA_NO_COMPRESSION_CONFIGURATION:
+        return "full"
     if runtime_configuration not in RAG_CONFIGURATION_SPECS:
         raise ValueError(f"unknown RAG configuration: {runtime_configuration}")
     return "full" if runtime_configuration in FIXED_CHECKPOINT_CONFIGURATIONS else runtime_configuration
@@ -1776,6 +1798,9 @@ class RAGDiagnostics:
     final_candidates:    int   = 0
     second_round_candidates: int = 0
     evidence_memory_tokens: int = 0
+    direct_context_document_tokens: int = 0
+    direct_context_prompt_tokens: int = 0
+    direct_context_ceiling: int = 0
     latency_ms:          float = 0.0
 
 
@@ -2249,51 +2274,76 @@ class RAGEnhancementPipeline:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 创新点 1: Compression Fidelity Reranking Signal (CFRS)
-# 用冻结 base decoder 的 teacher-forced next-token 概率误差衡量压缩保真度。
-# 误差越低，memory token 对原 passage 的条件重构越忠实。
+# 每篇文档比较 memory 与 non-memory 的平均隐状态；误差越低则保真度越高。
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CompressionFidelityReranker:
-    """
-    CFRS uses the frozen base decoder's teacher-forced next-token
-    squared-probability error.  The undetached error trains the compressor;
-    a detached copy is normalized and used only for hard final ordering.
-    """
+    """Hidden-mean fidelity signal used only for final passage ordering."""
 
     @staticmethod
-    def squared_probability_error(
-        logits: torch.Tensor,
-        target_ids: torch.Tensor,
-        target_mask: Optional[torch.Tensor] = None,
+    def hidden_mean_coordinate_mse(
+        memory_hidden_states: torch.Tensor,
+        memory_mask: torch.Tensor,
+        non_memory_hidden_states: torch.Tensor,
+        non_memory_mask: torch.Tensor,
+        memory_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute Eq. (5) without materializing one-hot target vectors.
+        """Return ``(1/d_h)||mean_M - mean_nonM||^2`` for every leading row.
 
-        For a target token y, ||p-onehot(y)||^2 equals
-        ``sum_v p_v^2 - 2 p_y + 1``.  The returned value is a token mean for
-        every leading row in ``logits``.
+        Memory and non-memory sequences may have different token lengths, but
+        must share all leading dimensions and the hidden width. Masks select
+        the actual positions used by the corresponding compressor forward.
+        When ``memory_weights`` is supplied (the soft ACR training path), the
+        memory mean is normalized by gate mass rather than sequence length.
         """
-        if logits.ndim < 2 or target_ids.shape != logits.shape[:-1]:
-            raise ValueError("target_ids must align with logits except for vocabulary")
-        if target_ids.dtype == torch.bool or torch.is_floating_point(target_ids):
-            raise ValueError("target_ids must use an integer dtype")
-        work = logits.float()
-        log_z = torch.logsumexp(work, dim=-1)
-        sum_squared_probability = torch.exp(
-            torch.logsumexp(2.0 * work, dim=-1) - 2.0 * log_z
+        if memory_hidden_states.ndim < 2 or non_memory_hidden_states.ndim < 2:
+            raise ValueError("CFRS hidden states require token and hidden dimensions")
+        if memory_hidden_states.shape[:-2] != non_memory_hidden_states.shape[:-2]:
+            raise ValueError("CFRS memory/non-memory leading dimensions must align")
+        if memory_hidden_states.size(-1) != non_memory_hidden_states.size(-1):
+            raise ValueError("CFRS memory/non-memory hidden widths must match")
+        if memory_mask.shape != memory_hidden_states.shape[:-1]:
+            raise ValueError("CFRS memory mask must align with memory hidden states")
+        if non_memory_mask.shape != non_memory_hidden_states.shape[:-1]:
+            raise ValueError("CFRS non-memory mask must align with non-memory hidden states")
+        if (
+            memory_weights is not None
+            and memory_weights.shape != memory_hidden_states.shape[:-1]
+        ):
+            raise ValueError("CFRS memory weights must align with memory hidden states")
+
+        memory_valid = memory_mask.to(
+            device=memory_hidden_states.device, dtype=torch.bool
         )
-        target_probability = torch.exp(
-            work.gather(-1, target_ids.long().unsqueeze(-1)).squeeze(-1) - log_z
+        non_memory_valid = non_memory_mask.to(
+            device=non_memory_hidden_states.device, dtype=torch.bool
         )
-        error = sum_squared_probability - 2.0 * target_probability + 1.0
-        if target_mask is None:
-            return error.mean(dim=-1)
-        if target_mask.shape != target_ids.shape:
-            raise ValueError("target_mask must have the same shape as target_ids")
-        mask = target_mask.to(device=error.device, dtype=torch.bool)
-        counts = mask.sum(dim=-1)
-        if (counts == 0).any():
-            raise ValueError("every CFRS row requires at least one target token")
-        return (error * mask).sum(dim=-1) / counts
+        non_memory_counts = non_memory_valid.sum(dim=-1)
+        if memory_weights is None:
+            memory_mass = memory_valid.sum(dim=-1).to(torch.float32)
+            memory_weight_values = memory_valid.to(torch.float32)
+        else:
+            memory_weight_values = memory_weights.to(
+                device=memory_hidden_states.device, dtype=torch.float32
+            )
+            if not torch.isfinite(memory_weight_values).all():
+                raise ValueError("CFRS memory weights must be finite")
+            if (memory_weight_values < 0).any():
+                raise ValueError("CFRS memory weights must be non-negative")
+            memory_weight_values = memory_weight_values * memory_valid.to(
+                memory_weight_values.dtype
+            )
+            memory_mass = memory_weight_values.sum(dim=-1)
+        if (memory_mass <= 0).any() or (non_memory_counts == 0).any():
+            raise ValueError("every CFRS row requires memory and non-memory positions")
+
+        memory_mean = (
+            memory_hidden_states.float() * memory_weight_values.unsqueeze(-1)
+        ).sum(dim=-2) / memory_mass.unsqueeze(-1)
+        non_memory_mean = (
+            non_memory_hidden_states.float() * non_memory_valid.unsqueeze(-1)
+        ).sum(dim=-2) / non_memory_counts.unsqueeze(-1)
+        return (memory_mean - non_memory_mean).square().mean(dim=-1)
 
     @staticmethod
     def rerank(original_scores: torch.Tensor,
@@ -2306,7 +2356,7 @@ class CompressionFidelityReranker:
 
         Args:
             original_scores: (B, N) — 来自 AHR/MADS 的原始相关性分数
-            per_doc_mse:     (B, N) — 每篇文档的 squared-probability error
+            per_doc_mse:     (B, N) — 每篇文档的 hidden-mean coordinate MSE
             cfrs_weight:     CFRS 分数的融合权重
         Returns:
             reranked_scores: (B, N)
@@ -2320,8 +2370,8 @@ class CompressionFidelityReranker:
             if valid.shape != original_scores.shape or (~valid).all(dim=1).any():
                 raise ValueError("CFRS requires at least one valid document per row")
 
-        # The ranking branch is fully detached.  Compressor supervision comes
-        # only from L_CFRS, never through argsort or this interpolation.
+        # CFRS is a forward-pass ordering signal, not an auxiliary objective.
+        # Its discrete ranking branch is intentionally detached.
         error = mse.detach()
         error_min = error.masked_fill(~valid, float("inf")).min(dim=1, keepdim=True).values
         error_max = error.masked_fill(~valid, float("-inf")).max(dim=1, keepdim=True).values
@@ -2394,11 +2444,17 @@ class AdaptiveCompressionAllocator:
             floors = min_ratios.to(device=scores.device, dtype=scores.dtype).reshape(-1, 1)
             if floors.size(0) != scores.size(0):
                 raise ValueError("one ACR minimum ratio is required per query")
+        # A non-degenerate row maps its extrema exactly to zero and one so the
+        # top document keeps all K0 tokens after floor(rho*K0). The release's
+        # explicit degenerate conventions use the interval midpoint for an
+        # all-tied multi-document set and rho_max for a singleton.
         normalized = (scores - score_min) / span.clamp_min(self.eps)
         ratios = floors + normalized * (self.max_ratio - floors)
         tied = span <= self.eps
         midpoint = (floors + self.max_ratio) / 2.0
-        ratios = torch.where(tied.expand_as(ratios), midpoint.expand_as(ratios), ratios)
+        ratios = torch.where(
+            tied.expand_as(ratios), midpoint.expand_as(ratios), ratios
+        )
         if scores.size(1) == 1:
             ratios = torch.full_like(ratios, self.max_ratio)
         return ratios
@@ -2429,8 +2485,16 @@ class AdaptiveCompressionAllocator:
         doc_embeddings: torch.Tensor,
         retain_ratios: torch.Tensor,
         base_token_counts: Optional[torch.Tensor] = None,
+        training_gate_mode: str = "soft",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply Eq. 7 and return embeddings, gates and effective token counts."""
+        """Apply ACR and return embeddings, applied gates and hard token counts.
+
+        ``soft`` is the paper's default sigmoid mask. ``hard_st`` uses the
+        inference allocation in the forward pass and the sigmoid derivative in
+        the backward pass.
+        """
+        if training_gate_mode not in {"soft", "hard_st"}:
+            raise ValueError("training_gate_mode must be 'soft' or 'hard_st'")
         n_docs, n_tokens, _ = doc_embeddings.shape
         ratios = retain_ratios.reshape(-1).to(doc_embeddings.device, torch.float32)
         if ratios.numel() != n_docs:
@@ -2450,13 +2514,21 @@ class AdaptiveCompressionAllocator:
                 raise ValueError("one base memory-token count is required per document")
         boundary = ratios.unsqueeze(1) * base_counts.unsqueeze(1)
         soft_mask = torch.sigmoid(self.beta * (boundary - token_positions))
-        gated = doc_embeddings * soft_mask.to(doc_embeddings.dtype).unsqueeze(-1)
-
-        # Inference retains exactly the raw states whose gates are at least 0.5.
         valid_base = token_positions.unsqueeze(0) <= base_counts.unsqueeze(1)
-        effective_counts = ((soft_mask >= 0.5) & valid_base).sum(dim=1).long()
+        soft_mask = soft_mask * valid_base.to(soft_mask.dtype)
+
+        # The inference realization is max(1, floor(rho*K0)).  Construct it
+        # directly so the one-token clamp also has an exact hard-ST forward.
+        effective_counts = torch.floor(boundary.squeeze(1)).long()
         effective_counts = effective_counts.clamp(min=1, max=n_tokens)
-        return gated, soft_mask, effective_counts
+        hard_mask = token_positions.unsqueeze(0) <= effective_counts.unsqueeze(1)
+        if training_gate_mode == "hard_st":
+            hard_float = hard_mask.to(soft_mask.dtype)
+            applied_mask = hard_float + soft_mask - soft_mask.detach()
+        else:
+            applied_mask = soft_mask
+        gated = doc_embeddings * applied_mask.to(doc_embeddings.dtype).unsqueeze(-1)
+        return gated, applied_mask, effective_counts
 
     def apply(self,
               doc_embeddings: torch.Tensor,
@@ -2479,6 +2551,7 @@ class AdaptiveCompressionAllocator:
                            n_docs_per_question: int,
                            min_ratios: Optional[torch.Tensor] = None,
                            base_token_counts: Optional[torch.Tensor] = None,
+                           training_gate_mode: str = "soft",
                            return_metadata: bool = False
                            ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
@@ -2503,6 +2576,7 @@ class AdaptiveCompressionAllocator:
             doc_embeddings,
             ratios.reshape(B * N),
             base_token_counts=base_token_counts,
+            training_gate_mode=training_gate_mode,
         )
         if return_metadata:
             return pruned, ratios, masks.view(B, N, -1), counts.view(B, N)
@@ -2806,8 +2880,9 @@ class CLaRaConfig(PretrainedConfig):
                  mtfrl_initialization_scheme: str = MTFRL_INITIALIZATION_SCHEME,
                  mtfrl_initialization_rank: Optional[int] = None,
                  mtfrl_hidden_width: Optional[int] = None,
-                 cfrs_reconstruction_scheme: str = CFRS_RECONSTRUCTION_SCHEME,
-                 cfrs_reconstruction_chunk_tokens: int = 128,
+                 cfrs_fidelity_scheme: str = CFRS_FIDELITY_SCHEME,
+                 retrieval_straight_through_scheme: str = RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
+                 acr_training_gate: str = "soft",
                  load_pretrained_checkpoint: bool = False,
                  device_map=None,
                  auto_map: dict = {
@@ -2889,20 +2964,22 @@ class CLaRaConfig(PretrainedConfig):
         self.mtfrl_initialization_scheme = mtfrl_initialization_scheme
         self.mtfrl_initialization_rank = mtfrl_initialization_rank
         self.mtfrl_hidden_width = mtfrl_hidden_width
-        if cfrs_reconstruction_scheme != CFRS_RECONSTRUCTION_SCHEME:
+        if cfrs_fidelity_scheme != CFRS_FIDELITY_SCHEME:
             raise ValueError(
-                "Unsupported CFRS reconstruction scheme "
-                f"{cfrs_reconstruction_scheme!r}; expected "
-                f"{CFRS_RECONSTRUCTION_SCHEME!r}"
+                "Unsupported CFRS fidelity scheme "
+                f"{cfrs_fidelity_scheme!r}; expected {CFRS_FIDELITY_SCHEME!r}"
             )
-        if (
-            not isinstance(cfrs_reconstruction_chunk_tokens, int)
-            or isinstance(cfrs_reconstruction_chunk_tokens, bool)
-            or cfrs_reconstruction_chunk_tokens <= 0
-        ):
-            raise ValueError("cfrs_reconstruction_chunk_tokens must be a positive integer")
-        self.cfrs_reconstruction_scheme = cfrs_reconstruction_scheme
-        self.cfrs_reconstruction_chunk_tokens = int(cfrs_reconstruction_chunk_tokens)
+        if retrieval_straight_through_scheme != RETRIEVAL_STRAIGHT_THROUGH_SCHEME:
+            raise ValueError(
+                "Unsupported retrieval straight-through scheme "
+                f"{retrieval_straight_through_scheme!r}; expected "
+                f"{RETRIEVAL_STRAIGHT_THROUGH_SCHEME!r}"
+            )
+        self.cfrs_fidelity_scheme = cfrs_fidelity_scheme
+        self.retrieval_straight_through_scheme = retrieval_straight_through_scheme
+        if acr_training_gate not in {"soft", "hard_st"}:
+            raise ValueError("acr_training_gate must be 'soft' or 'hard_st'")
+        self.acr_training_gate = acr_training_gate
 
         if training_form == 'compressor':
             assert compr_model_name is not None and not self.lora
@@ -3306,6 +3383,14 @@ class CLaRa(PreTrainedModel):
             rag_config:     RAGPipelineConfig；None 则使用默认参数。
         """
         cfg = rag_config or RAGPipelineConfig(top_k=self.stage2_retrieval_top_n or 5)
+        recorded_acr_training_gate = getattr(
+            self.config, "acr_training_gate", "soft"
+        )
+        if cfg.acr_training_gate != recorded_acr_training_gate:
+            raise ValueError(
+                "Runtime ACR training gate must match checkpoint/config provenance: "
+                f"{cfg.acr_training_gate!r} != {recorded_acr_training_gate!r}"
+            )
         recorded_mads_name = getattr(
             self.config,
             "mads_semantic_model_name",
@@ -3679,11 +3764,14 @@ class CLaRa(PreTrainedModel):
                 or (~valid_documents).all(dim=1).any()
             ):
                 raise ValueError("MTFRL requires at least one real document per row")
-        # Equation (10) averages real documents, then normalizes after P_fb.
+        # MTFRL averages real documents and normalizes the pooled hidden state
+        # before applying P_fb.
         q_memory = (
             per_document * valid_documents.to(per_document.dtype).unsqueeze(-1)
         ).sum(dim=1) / valid_documents.sum(dim=1, keepdim=True)
-        q_memory = q_memory.float()
+        q_memory = F.normalize(
+            q_memory.float(), dim=-1, eps=self._rag_config.numerical_epsilon
+        )
 
         if self._mtfrl_projection is None:
             raise RuntimeError("MTFRL projection head has not been initialized or loaded")
@@ -3695,8 +3783,34 @@ class CLaRa(PreTrainedModel):
         projected = self._mtfrl_projection(
             q_memory.to(self._mtfrl_projection[0].weight.dtype)
         )
+        # Dense search uses cosine similarity, so normalize P_fb's output as a
+        # retrieval representation as well; this does not change Eq. (MTFRL)'s
+        # required input ordering above.
         return F.normalize(
             projected.float(), dim=-1, eps=self._rag_config.numerical_epsilon
+        )
+
+    def _compute_first_pass_feedback_query(
+        self,
+        first_pass: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Pool first-pass memory with the gate representation in use.
+
+        Training stores already gated memory and therefore uses gate-mass
+        normalization. Evaluation and generation store raw memory and pool
+        only the physically retained prefix.
+        """
+        if self.training:
+            return self._compute_mtfrl_feedback_query(
+                first_pass["memory"],
+                gates=first_pass["gates"],
+                base_counts=first_pass["base_counts"],
+                document_mask=first_pass["document_mask"],
+            )
+        return self._compute_mtfrl_feedback_query(
+            first_pass["memory"],
+            effective_counts=first_pass["effective_counts"],
+            document_mask=first_pass["document_mask"],
         )
 
     def _create_decoder(self, cfg: CLaRaConfig) -> AutoModelForCausalLM:
@@ -4029,15 +4143,14 @@ class CLaRa(PreTrainedModel):
                                     ],
                                 ]:
         """
-        Run the compressor and optionally expose the exact token alignment
-        consumed by the separate teacher-forced CFRS decoder pass.
+        Run the compressor and optionally expose hidden states for CFRS.
 
         Returns:
             compressed_embs: (N, n_mem_tokens, hidden)
             mse_loss:        scalar — 原有的批量平均 MSE（用于训练 loss，保持不变）
-            compatibility slot: always None (CFRS is not a latent-state MSE)
+            compatibility slot: always None
             alignment context (when requested): detached source hidden states,
-                non-memory attention mask, and pre-ACR memory-token counts
+                non-memory mask, and pre-ACR memory-token counts
         """
         if self.compr:
             # External-compressor path returns its standard compression outputs.
@@ -4048,8 +4161,8 @@ class CLaRa(PreTrainedModel):
                 )
             return compressed, mse_loss, None
 
-        # Reuse the integrated compressor pass and expose token alignment for
-        # the separate frozen-decoder CFRS objective.
+        # Reuse the integrated compressor pass so CFRS compares hidden states
+        # from the same document forward.
         assert enc_input_ids.size() == enc_attention_mask.size()
 
         if 'encoder_adapter' in self.adapter_keys:
@@ -4072,13 +4185,17 @@ class CLaRa(PreTrainedModel):
         attn         = enc_attention_mask.bool()
         mem_mask     = mask & attn
         non_mem_mask = (~mask) & attn
-        special_ids = torch.tensor(
-            sorted(set(self.decoder_tokenizer.all_special_ids)),
+        special_ids = torch.as_tensor(
+            self.decoder_tokenizer.all_special_ids,
             device=enc_input_ids.device,
             dtype=enc_input_ids.dtype,
         )
-        content_mask = non_mem_mask & ~torch.isin(enc_input_ids, special_ids)
-
+        special_mask = (
+            torch.isin(enc_input_ids, special_ids)
+            if special_ids.numel()
+            else torch.zeros_like(enc_input_ids, dtype=torch.bool)
+        )
+        source_non_memory_mask = non_mem_mask & ~special_mask
         mem_len     = mem_mask.sum(dim=1)
         non_mem_len = non_mem_mask.sum(dim=1)
 
@@ -4086,9 +4203,6 @@ class CLaRa(PreTrainedModel):
             raise ValueError("Some samples have no memory tokens")
         if (non_mem_len == 0).any():
             raise ValueError("Some samples have no non-memory tokens")
-        if (content_mask.sum(dim=1) == 0).any():
-            raise ValueError("CFRS reconstruction requires document content tokens")
-
         mem_mean     = (emb * mem_mask.unsqueeze(-1)).sum(dim=1) / mem_len.unsqueeze(-1)
         non_mem_mean = (emb * non_mem_mask.unsqueeze(-1)).sum(dim=1) / non_mem_len.unsqueeze(-1)
 
@@ -4099,14 +4213,18 @@ class CLaRa(PreTrainedModel):
             emb, enc_input_ids, enc_attention_mask
         )
         if return_alignment_context:
-            # CFRS gradients enter only through compressed memory and the
-            # frozen base decoder; source token IDs are discrete targets.
+            # CFRS is detached because it controls a discrete final ordering;
+            # Phase II is optimized only by QA and hidden-state LMSE.
+            if (source_non_memory_mask.sum(dim=1) == 0).any():
+                raise ValueError(
+                    "CFRS requires a non-special source position for every document"
+                )
             return (
                 compressed_embs,
                 mse_loss,
                 None,
                 emb.detach(),
-                content_mask,
+                source_non_memory_mask,
                 memory_counts,
             )
         return compressed_embs, mse_loss, None
@@ -4199,24 +4317,6 @@ class CLaRa(PreTrainedModel):
         )
         return self._project_query_reps_to_bge(query_rep)[0]
 
-    def _differentiable_fused_scores(
-        self,
-        query_bge: torch.Tensor,
-        evidence: List[List[_ScoredDoc]],
-        feedback_query: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Materialize detached CCEF scores for discrete ACR/order decisions."""
-        n_docs = len(evidence[0])
-        if any(len(docs) != n_docs for docs in evidence):
-            raise ValueError("score tensorization requires an equal document count")
-        # The name is retained for checkpoint/API compatibility.  The paper
-        # explicitly stops gradients at retrieval scores, sorting and top-k.
-        return torch.tensor(
-            [[doc.fused_score for doc in docs] for docs in evidence],
-            device=query_bge.device,
-            dtype=torch.float32,
-        ).detach()
-
     def _acr_min_ratios(
         self,
         qca_results: Sequence[QCAResult],
@@ -4239,90 +4339,52 @@ class CLaRa(PreTrainedModel):
         self,
         memory_embeddings: torch.Tensor,
         memory_counts: torch.Tensor,
-        source_input_ids: torch.Tensor,
-        source_content_mask: torch.Tensor,
+        source_hidden_states: torch.Tensor,
+        source_non_memory_mask: torch.Tensor,
+        memory_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Evaluate Eq. (5) with the frozen base decoder and gold prefixes."""
+        """Compute per-document hidden-mean CFRS errors from one compressor pass."""
         if memory_embeddings.dim() != 4:
             raise ValueError("CFRS memory must have shape (B, N, T, H)")
-        batch, n_docs, n_tokens, _ = memory_embeddings.shape
+        batch, n_docs, n_tokens, hidden = memory_embeddings.shape
         if memory_counts.shape != (batch, n_docs):
             raise ValueError("CFRS requires one memory count per selected document")
-        if source_input_ids.shape != source_content_mask.shape:
-            raise ValueError("CFRS source IDs and content mask must align")
-        if source_input_ids.size(0) != batch * n_docs:
-            raise ValueError("CFRS requires one truncated source row per document")
+        if source_hidden_states.dim() != 3 or source_hidden_states.shape[0] != batch * n_docs:
+            raise ValueError("CFRS requires one source-hidden row per selected document")
+        if source_hidden_states.size(-1) != hidden:
+            raise ValueError("CFRS source and memory hidden widths must match")
+        if source_non_memory_mask.shape != source_hidden_states.shape[:-1]:
+            raise ValueError("CFRS source hidden states and non-memory mask must align")
+        if (
+            memory_weights is not None
+            and memory_weights.shape != memory_embeddings.shape[:-1]
+        ):
+            raise ValueError("CFRS memory weights must have shape (B, N, T)")
+        if memory_counts.dtype == torch.bool or torch.is_floating_point(memory_counts):
+            raise ValueError("CFRS memory counts must use an integer dtype")
+        if (memory_counts < 1).any() or (memory_counts > n_tokens).any():
+            raise ValueError("CFRS memory counts must lie in [1, T]")
 
-        prefix_ids = self.decoder_tokenizer.encode(
-            CFRS_RECONSTRUCTION_PREFIX,
-            add_special_tokens=True,
-        )
-        if not prefix_ids:
-            raise RuntimeError("CFRS reconstruction prefix tokenized to an empty sequence")
-        memory_token_ids = self.decoder_tokenizer.mem_token_ids
-        causal_lm = (
-            self.decoder.get_base_model()
-            if hasattr(self.decoder, "get_base_model")
-            else self.decoder
-        )
-        transformer = getattr(causal_lm, "model", None)
-        output_head = causal_lm.get_output_embeddings()
-        if transformer is None or output_head is None:
-            raise RuntimeError("CFRS requires a causal LM backbone and output embedding head")
-        chunk_tokens = int(self.config.cfrs_reconstruction_chunk_tokens)
         flat_memory = memory_embeddings.reshape(batch * n_docs, n_tokens, -1)
-        flat_counts = memory_counts.reshape(-1)
-        per_document: List[torch.Tensor] = []
-
-        # A per-document pass bounds the vocabulary-logit working set while
-        # retaining the exact gold-prefix conditioning in Eq. (5).
-        with _base_decoder_only(self.decoder):
-            for row_index in range(batch * n_docs):
-                count = int(flat_counts[row_index].item())
-                if count < 1 or count > n_tokens:
-                    raise ValueError("CFRS memory counts must lie in [1, T]")
-                target_ids = source_input_ids[row_index][
-                    source_content_mask[row_index].bool()
-                ].to(self.decoder.device)
-                if target_ids.numel() == 0:
-                    raise ValueError("CFRS requires at least one non-delimiter source token")
-                row_ids = torch.tensor(
-                    prefix_ids
-                    + [int(value) for value in memory_token_ids[:count]]
-                    + target_ids.detach().cpu().tolist(),
-                    device=self.decoder.device,
-                    dtype=torch.long,
-                ).unsqueeze(0)
-                inputs_embeds = self.decoder.get_input_embeddings()(row_ids)
-                prefix_length = len(prefix_ids)
-                inputs_embeds = inputs_embeds.clone()
-                inputs_embeds[0, prefix_length : prefix_length + count] = flat_memory[
-                    row_index, :count
-                ].to(inputs_embeds.dtype)
-                attention_mask = torch.ones_like(row_ids)
-                base_output = transformer(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    return_dict=True,
+        flat_counts = memory_counts.reshape(-1).to(memory_embeddings.device)
+        memory_mask = (
+            torch.arange(n_tokens, device=memory_embeddings.device).unsqueeze(0)
+            < flat_counts.unsqueeze(1)
+        )
+        errors = CompressionFidelityReranker.hidden_mean_coordinate_mse(
+            flat_memory,
+            memory_mask,
+            source_hidden_states.to(memory_embeddings.device),
+            source_non_memory_mask.to(memory_embeddings.device),
+            memory_weights=(
+                memory_weights.reshape(batch * n_docs, n_tokens).to(
+                    memory_embeddings.device
                 )
-                hidden_states = base_output.last_hidden_state
-                prediction_start = prefix_length + count - 1
-                prediction_states = hidden_states[
-                    0, prediction_start : prediction_start + target_ids.numel()
-                ]
-                if prediction_states.size(0) != target_ids.numel():
-                    raise RuntimeError("CFRS target predictions were truncated")
-                error_sum = prediction_states.new_zeros((), dtype=torch.float32)
-                for start in range(0, target_ids.numel(), chunk_tokens):
-                    stop = min(start + chunk_tokens, target_ids.numel())
-                    logits = output_head(prediction_states[start:stop])
-                    chunk_error = CompressionFidelityReranker.squared_probability_error(
-                        logits.unsqueeze(0), target_ids[start:stop].unsqueeze(0)
-                    )[0]
-                    error_sum = error_sum + chunk_error * (stop - start)
-                per_document.append(error_sum / target_ids.numel())
-        return torch.stack(per_document).view(batch, n_docs)
+                if memory_weights is not None
+                else None
+            ),
+        )
+        return errors.view(batch, n_docs)
 
     def _compress_evidence(
         self,
@@ -4351,8 +4413,8 @@ class CLaRa(PreTrainedModel):
             compressed,
             _,
             _,
-            _,
-            source_content_mask,
+            source_hidden_states,
+            source_non_memory_mask,
             base_counts,
         ) = self._compress_with_fidelity(
             encoded["input_ids"].to(self.decoder.device),
@@ -4364,7 +4426,7 @@ class CLaRa(PreTrainedModel):
         raw_memory = compressed.new_zeros(
             (batch, max_docs, n_tokens, self.hidden_size)
         )
-        soft_memory = torch.zeros_like(raw_memory)
+        gated_memory = torch.zeros_like(raw_memory)
         fused_scores = torch.full(
             (batch, max_docs), float("-inf"), device=device, dtype=torch.float32
         )
@@ -4375,7 +4437,9 @@ class CLaRa(PreTrainedModel):
         document_mask = torch.zeros(batch, max_docs, device=device, dtype=torch.bool)
         per_doc_mse = torch.zeros(batch, max_docs, device=device, dtype=torch.float32)
         min_ratios = self._acr_min_ratios(qca_results, device)
-        source_ids = encoded["input_ids"].to(self.decoder.device)
+        training_gate_mode = (
+            self._rag_config.acr_training_gate if self.training else "soft"
+        )
         offset = 0
         for row_index, documents in enumerate(evidence):
             count = len(documents)
@@ -4398,6 +4462,7 @@ class CLaRa(PreTrainedModel):
                         count,
                         min_ratios=min_ratios[row_index : row_index + 1],
                         base_token_counts=row_base_counts,
+                        training_gate_mode=training_gate_mode,
                         return_metadata=True,
                     )
                 )
@@ -4421,6 +4486,7 @@ class CLaRa(PreTrainedModel):
                         row_compressed,
                         flat_ratios,
                         base_token_counts=row_base_counts,
+                        training_gate_mode=training_gate_mode,
                     )
                 )
                 row_ratios = flat_ratios.view(1, count)
@@ -4435,7 +4501,7 @@ class CLaRa(PreTrainedModel):
             else:  # guarded by RAGPipelineConfig.__post_init__
                 raise RuntimeError(f"unsupported allocation mode: {allocation_mode}")
             raw_memory[row_index, :count] = row_compressed
-            soft_memory[row_index, :count] = row_gated.view(
+            gated_memory[row_index, :count] = row_gated.view(
                 count, n_tokens, self.hidden_size
             )
             fused_scores[row_index, :count] = row_scores[0]
@@ -4444,31 +4510,32 @@ class CLaRa(PreTrainedModel):
             effective_counts[row_index, :count] = row_effective[0]
             padded_base_counts[row_index, :count] = row_base_counts
             document_mask[row_index, :count] = True
-            row_memory = (
-                soft_memory[row_index : row_index + 1, :count]
-                if self.training
-                else raw_memory[row_index : row_index + 1, :count]
-            )
+            row_memory = raw_memory[row_index : row_index + 1, :count]
             row_context_counts = (
                 row_base_counts.view(1, count)
-                if self.training
+                if self.training and training_gate_mode == "soft"
                 else row_effective
             )
             if compute_cfrs:
                 per_doc_mse[row_index, :count] = self._compute_cfrs_errors(
                     row_memory,
                     row_context_counts,
-                    source_ids[row_slice],
-                    source_content_mask[row_slice],
+                    source_hidden_states[row_slice],
+                    source_non_memory_mask[row_slice],
+                    memory_weights=row_gates if self.training else None,
                 )[0]
             offset += count
         if offset != compressed.size(0):
             raise RuntimeError("variable evidence packing lost a document")
 
-        # Training supplies every real soft-gated base state. Inference retains
-        # only raw states whose gate reaches the hard 0.5 threshold.
-        memory = soft_memory if self.training else raw_memory
-        context_counts = padded_base_counts if self.training else effective_counts
+        # Soft training supplies every real sigmoid-gated state. Hard-ST
+        # training and inference expose exactly the realized prefix length.
+        memory = gated_memory if self.training else raw_memory
+        context_counts = (
+            padded_base_counts
+            if self.training and training_gate_mode == "soft"
+            else effective_counts
+        )
         return {
             "memory": memory,
             "fused_scores": fused_scores,
@@ -4481,205 +4548,235 @@ class CLaRa(PreTrainedModel):
             "document_mask": document_mask,
         }
 
-    def _retrieval_auxiliary_losses(
+    def _apply_selected_doc_cosine_identity_st(
         self,
-        batch: Dict[str, Any],
-        first_pass_evidence: Sequence[Sequence[_ScoredDoc]],
+        memory_embeddings: torch.Tensor,
+        evidence: Sequence[Sequence[_ScoredDoc]],
         query_bge: torch.Tensor,
-        feedback_query: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[str]]]:
-        """Build the shared support sample and Eqs. (11)--(12) exactly."""
+        feedback_query: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Attach an identity-forward cosine surrogate to selected memories.
+
+        Retrieval and document identities stay exactly hard in the forward
+        pass. In backward, the QA/LMSE gradient on each selected memory block
+        reaches QR through its cosine with that document's frozen BGE vector,
+        and reaches P_fb through the corresponding feedback cosine.
+        """
+        if memory_embeddings.ndim != 4:
+            raise ValueError("selected-document ST requires memory shape (B, N, T, H)")
+        batch, n_docs, _, _ = memory_embeddings.shape
+        if query_bge.ndim != 2 or query_bge.size(0) != batch:
+            raise ValueError("selected-document ST query batch must align with memory")
+        if len(evidence) != batch or any(
+            not 1 <= len(documents) <= n_docs for documents in evidence
+        ):
+            raise ValueError("selected-document ST evidence must align with memory slots")
         if self.rag_pipeline is None or self.rag_pipeline.ahr.dense_embeddings is None:
-            raise RuntimeError("retrieval auxiliary losses require the frozen BGE index")
-        raw_supports = batch.get("gold_doc_ids")
-        if not isinstance(raw_supports, (list, tuple)) or len(raw_supports) != len(
-            first_pass_evidence
-        ):
-            raise ValueError("Phase II requires gold_doc_ids aligned with the minibatch")
-        occurrence_ids = batch.get("sample_occurrence_ids")
-        if (
-            not isinstance(occurrence_ids, (list, tuple))
-            or len(occurrence_ids) != len(first_pass_evidence)
-            or any(not isinstance(value, str) or not value for value in occurrence_ids)
-        ):
-            raise ValueError(
-                "Phase II requires one stable sample occurrence ID per minibatch row"
-            )
-        metadata = getattr(self, "_aria_corpus_metadata", {})
-        id_to_index = self.rag_pipeline.ahr._id_to_idx
-
-        def page_id(document_id: str) -> str:
-            record = metadata.get(document_id)
-            if isinstance(record, Mapping) and isinstance(record.get("page_url"), str):
-                return record["page_url"]
-            return document_id
-
-        run_seed = int(getattr(self.config, "aria_training_seed", 42))
-        selected_positive_ids: List[Optional[str]] = []
-        support_page_sets: List[set[str]] = []
-        for row_index, (support_values, d1) in enumerate(
-            zip(raw_supports, first_pass_evidence)
-        ):
-            supports = [str(value) for value in support_values]
-            if not supports:
-                selected_positive_ids.append(None)
-                support_page_sets.append(set())
-                continue
-            unknown = [document_id for document_id in supports if document_id not in id_to_index]
-            if unknown:
-                raise ValueError(
-                    f"Phase-II support {unknown[0]!r} is absent from the retrieval corpus"
-                )
-            support_pages = {page_id(document_id) for document_id in supports}
-            d1_pages = {page_id(document.doc_id) for document in d1}
-            missing = [
-                document_id
-                for document_id in supports
-                if page_id(document_id) not in d1_pages
-            ]
-            candidates = missing or supports
-            occurrence_seed = int.from_bytes(
-                hashlib.sha256(
-                    f"{run_seed}\0{occurrence_ids[row_index]}".encode("utf-8")
-                ).digest()[:8],
-                "big",
-            )
-            selected_positive_ids.append(
-                random.Random(occurrence_seed).choice(candidates)
-            )
-            support_page_sets.append(support_pages)
-
-        # The paper's B is the no-accumulation global data-parallel minibatch.
-        # Gather only stable corpus IDs: BGE document vectors are frozen and
-        # already available on every rank, so no cross-rank autograd is needed.
-        rank = 0
-        global_positive_entries: List[Tuple[int, int, Optional[str]]]
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-            gathered: List[Optional[List[Tuple[int, int, Optional[str]]]]] = [
-                None for _ in range(world_size)
-            ]
-            local_entries = [
-                (rank, row_index, document_id)
-                for row_index, document_id in enumerate(selected_positive_ids)
-            ]
-            torch.distributed.all_gather_object(gathered, local_entries)
-            if any(entries is None for entries in gathered):
-                raise RuntimeError("in-batch positive all-gather returned an empty rank")
-            global_positive_entries = [
-                entry for entries in gathered for entry in (entries or [])
-            ]
-        else:
-            global_positive_entries = [
-                (rank, row_index, document_id)
-                for row_index, document_id in enumerate(selected_positive_ids)
-            ]
-
-        def global_pointwise_mean(
-            terms: Sequence[torch.Tensor], anchor: torch.Tensor
-        ) -> torch.Tensor:
-            local_sum = (
-                torch.stack(list(terms)).sum()
-                if terms
-                else anchor.sum() * 0.0
-            )
-            local_count = torch.tensor(
-                float(len(terms)), device=anchor.device, dtype=torch.float32
-            )
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                global_count = local_count.clone()
-                torch.distributed.all_reduce(
-                    global_count, op=torch.distributed.ReduceOp.SUM
-                )
-                if global_count.item() == 0:
-                    return local_sum
-                # DDP averages rank gradients. This scale makes that average
-                # equal the paper's pointwise mean over global B_sup/B_mt.
-                return local_sum * (
-                    torch.distributed.get_world_size() / global_count
-                )
-            return local_sum / local_count.clamp_min(1.0)
+            raise RuntimeError("selected-document ST requires the frozen BGE corpus index")
+        if feedback_query is not None and feedback_query.shape != query_bge.shape:
+            raise ValueError("selected-document ST feedback/query shapes must match")
 
         dense_index = self.rag_pipeline.ahr.dense_embeddings
-        supported_rows = [
-            row for row, document_id in enumerate(selected_positive_ids)
-            if document_id is not None
-        ]
-        positive_embeddings: Dict[int, torch.Tensor] = {}
-        for row in supported_rows:
-            document_id = selected_positive_ids[row]
-            assert document_id is not None
-            positive_embeddings[row] = F.normalize(
-                dense_index[id_to_index[document_id]].to(
-                    device=query_bge.device, dtype=torch.float32
-                ),
-                dim=-1,
-                eps=self._rag_config.numerical_epsilon,
-            )
-        qr_terms = [
-            1.0
-            - F.normalize(
-                query_bge[row].float(),
-                dim=-1,
-                eps=self._rag_config.numerical_epsilon,
-            ).dot(
-                positive_embeddings[row]
-            )
-            for row in supported_rows
-        ]
-        qr_loss = global_pointwise_mean(qr_terms, query_bge)
-
-        if feedback_query is None or self._mtfrl is None:
-            return qr_loss, query_bge.sum() * 0.0, selected_positive_ids
-
-        pointwise_mtfrl: List[torch.Tensor] = []
-        for row_index in supported_rows:
-            d1 = first_pass_evidence[row_index]
-            candidates: List[str] = []
-            seen_pages: set[str] = set()
-            for document in d1:
-                pid = page_id(document.doc_id)
-                if pid not in support_page_sets[row_index] and pid not in seen_pages:
-                    candidates.append(document.doc_id)
-                    seen_pages.add(pid)
-            for other_rank, other_index, positive_id in global_positive_entries:
-                if (
-                    (other_rank == rank and other_index == row_index)
-                    or positive_id is None
-                ):
-                    continue
-                pid = page_id(positive_id)
-                if pid not in support_page_sets[row_index] and pid not in seen_pages:
-                    candidates.append(positive_id)
-                    seen_pages.add(pid)
-            if not candidates:
-                continue
-            negative_indices = torch.tensor(
-                [id_to_index[document_id] for document_id in candidates],
-                dtype=torch.long,
-            )
-            negatives = dense_index.index_select(0, negative_indices).to(
-                device=feedback_query.device, dtype=torch.float32
-            )
-            alternatives = torch.cat(
-                (positive_embeddings[row_index].unsqueeze(0), negatives), dim=0
-            )
-            logits = (
-                F.normalize(
-                    feedback_query[row_index].float(),
-                    dim=-1,
-                    eps=self._rag_config.numerical_epsilon,
+        selected_vectors = torch.zeros(
+            batch,
+            n_docs,
+            query_bge.size(-1),
+            device=query_bge.device,
+            dtype=torch.float32,
+        )
+        document_mask = torch.zeros(
+            batch, n_docs, device=query_bge.device, dtype=torch.bool
+        )
+        for row, documents in enumerate(evidence):
+            corpus_indices = [document.corpus_index for document in documents]
+            if any(index < 0 or index >= dense_index.size(0) for index in corpus_indices):
+                raise ValueError(
+                    "selected-document ST requires corpus-backed evidence documents"
                 )
-                @ F.normalize(
-                    alternatives,
-                    dim=-1,
-                    eps=self._rag_config.numerical_epsilon,
-                ).T
-            ) / self._rag_config.mtfrl_temperature
-            pointwise_mtfrl.append(-F.log_softmax(logits, dim=0)[0])
-        mtfrl_loss = global_pointwise_mean(pointwise_mtfrl, feedback_query)
-        return qr_loss, mtfrl_loss, selected_positive_ids
+            index_tensor = torch.tensor(corpus_indices, dtype=torch.long)
+            vectors = dense_index.index_select(0, index_tensor).to(
+                device=query_bge.device, dtype=torch.float32
+            )
+            selected_vectors[row, : len(documents)] = F.normalize(
+                vectors, dim=-1, eps=self._rag_config.numerical_epsilon
+            )
+            document_mask[row, : len(documents)] = True
+
+        normalized_query = F.normalize(
+            query_bge.float(), dim=-1, eps=self._rag_config.numerical_epsilon
+        )
+        query_cosine = torch.einsum(
+            "bd,bnd->bn", normalized_query, selected_vectors
+        )
+        query_cosine = query_cosine.masked_fill(~document_mask, 0.0)
+        query_identity = 1.0 + (query_cosine - query_cosine.detach())
+        output = memory_embeddings * query_identity.to(
+            memory_embeddings.dtype
+        ).unsqueeze(-1).unsqueeze(-1)
+        if feedback_query is not None:
+            normalized_feedback = F.normalize(
+                feedback_query.float(),
+                dim=-1,
+                eps=self._rag_config.numerical_epsilon,
+            )
+            feedback_cosine = torch.einsum(
+                "bd,bnd->bn", normalized_feedback, selected_vectors
+            )
+            feedback_cosine = feedback_cosine.masked_fill(~document_mask, 0.0)
+            feedback_identity = 1.0 + (
+                feedback_cosine - feedback_cosine.detach()
+            )
+            output = output * feedback_identity.to(
+                memory_embeddings.dtype
+            ).unsqueeze(-1).unsqueeze(-1)
+        return output
+
+    def _resolve_no_compression_context_limit(self) -> int:
+        """Return the fixed NoComp ceiling bounded by the loaded decoder.
+
+        ``stage2_input_max_length`` is deliberately not consulted: it is the
+        compressed Phase-II prompt ceiling, whereas ARIA-NoComp is the paper's
+        separate direct-context diagnostic. The release never truncates a
+        selected passage. It therefore needs an explicit decoder capacity and
+        fails closed when a complete prompt plus its 64-token output budget
+        cannot fit.
+        """
+        decoder_config = getattr(self.decoder, "config", None)
+        model_limit = None
+        for name in ("max_position_embeddings", "n_positions"):
+            raw_value = getattr(decoder_config, name, None)
+            if isinstance(raw_value, bool) or raw_value is None:
+                continue
+            try:
+                candidate = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                model_limit = candidate
+                break
+        if model_limit is None:
+            raise RuntimeError(
+                "ARIA-NoComp requires an explicit decoder context capacity"
+            )
+
+        limits = [ARIA_NO_COMPRESSION_CONTEXT_CEILING, model_limit]
+        tokenizer_limit = getattr(self.decoder_tokenizer, "model_max_length", None)
+        if not isinstance(tokenizer_limit, bool) and tokenizer_limit is not None:
+            try:
+                tokenizer_limit = int(tokenizer_limit)
+            except (TypeError, ValueError, OverflowError):
+                tokenizer_limit = None
+            # Hugging Face uses enormous integers as an "unknown" sentinel.
+            if tokenizer_limit is not None and 0 < tokenizer_limit < 1_000_000:
+                limits.append(tokenizer_limit)
+        context_limit = min(limits)
+        if context_limit <= ARIA_NO_COMPRESSION_MAX_NEW_TOKENS:
+            raise RuntimeError(
+                "ARIA-NoComp decoder context is too short for its generation budget"
+            )
+        return context_limit
+
+    def _generate_no_compression_context(
+        self,
+        questions: Sequence[str],
+        evidence: Sequence[Sequence[_ScoredDoc]],
+        max_new_tokens: int,
+    ) -> Tuple[List[str], torch.Tensor, torch.Tensor, int]:
+        """Generate from first-pass raw passages without compression or truncation."""
+        if max_new_tokens != ARIA_NO_COMPRESSION_MAX_NEW_TOKENS:
+            raise ValueError(
+                "ARIA-NoComp requires exactly 64 generated-token slots"
+            )
+        if len(questions) == 0 or len(evidence) != len(questions):
+            raise ValueError("ARIA-NoComp questions and evidence must align")
+        if any(
+            not 1 <= len(documents) <= self.generation_top_k
+            for documents in evidence
+        ):
+            raise ValueError("ARIA-NoComp requires 1--5 first-pass documents per query")
+
+        raw_contexts: List[str] = []
+        document_token_counts: List[int] = []
+        for documents in evidence:
+            document_texts = [document.text for document in documents]
+            if any(not isinstance(text, str) or not text.strip() for text in document_texts):
+                raise ValueError("ARIA-NoComp requires non-empty raw passage text")
+            # Two newlines are the only inter-document separator. No document
+            # labels, memory tokens, compressor delimiters, or rewritten text
+            # are introduced.
+            raw_contexts.append("\n\n".join(document_texts))
+            token_count = sum(
+                len(
+                    self.decoder_tokenizer.encode(
+                        text,
+                        add_special_tokens=False,
+                        truncation=False,
+                    )
+                )
+                for text in document_texts
+            )
+            if token_count <= 0:
+                raise ValueError("ARIA-NoComp raw passages must contain decoder tokens")
+            document_token_counts.append(token_count)
+
+        prompts = [
+            self._blend_standard_prompt(context, question, None)
+            for question, context in zip(questions, raw_contexts)
+        ]
+        if any(not isinstance(prompt, str) or not prompt for prompt in prompts):
+            raise RuntimeError("ARIA-NoComp failed to build a direct-context QA prompt")
+        decoder_inputs = self.decoder_tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding="longest",
+            add_special_tokens=False,
+            truncation=False,
+        )
+        dec_input_ids = decoder_inputs["input_ids"].to(self.decoder.device)
+        dec_attention_mask = decoder_inputs["attention_mask"].to(self.decoder.device)
+        prompt_lengths = dec_attention_mask.sum(dim=1).long()
+        context_limit = self._resolve_no_compression_context_limit()
+        required_lengths = prompt_lengths + max_new_tokens
+        if torch.any(required_lengths > context_limit):
+            row = int(
+                torch.nonzero(required_lengths > context_limit, as_tuple=False)[0].item()
+            )
+            raise ValueError(
+                "ARIA-NoComp prompt exceeds its no-truncation decoder ceiling: "
+                f"row {row} needs {int(required_lengths[row].item())} tokens "
+                f"({int(prompt_lengths[row].item())} prompt + {max_new_tokens} output), "
+                f"limit {context_limit}"
+            )
+        if "decoder_adapter" not in self.adapter_keys:
+            raise ValueError("ARIA-NoComp requires the Phase-II decoder_adapter")
+        self.decoder.set_adapter("decoder_adapter")
+        output_ids = self.decoder.generate(
+            input_ids=dec_input_ids,
+            attention_mask=dec_attention_mask,
+            do_sample=False,
+            top_p=None,
+            temperature=None,
+            max_new_tokens=max_new_tokens,
+            num_beams=1,
+            eos_token_id=self.decoder_tokenizer.eos_token_id,
+            pad_token_id=self.decoder_tokenizer.pad_token_id,
+        )
+        prompt_width = dec_input_ids.size(1)
+        if output_ids.ndim != 2 or output_ids.size(1) < prompt_width:
+            raise RuntimeError("ARIA-NoComp decoder returned malformed token IDs")
+        decoded = self.decoder_tokenizer.batch_decode(
+            output_ids[:, prompt_width:], skip_special_tokens=True
+        )
+        return (
+            decoded,
+            prompt_lengths,
+            torch.tensor(
+                document_token_counts,
+                device=prompt_lengths.device,
+                dtype=torch.long,
+            ),
+            context_limit,
+        )
 
     def generate_from_questions(
         self,
@@ -4692,6 +4789,7 @@ class CLaRa(PreTrainedModel):
         time_count: bool = False,
         return_first_pass_indices: bool = False,
         oracle_gold_indices: Optional[Sequence[Sequence[int]]] = None,
+        no_compression: bool = False,
     ) -> Tuple[List[str], torch.Tensor]:
         """Run the full two-round ARIA inference algorithm from Appendix A.1.
 
@@ -4709,6 +4807,33 @@ class CLaRa(PreTrainedModel):
                 "ARIA Algorithm 1 inference requires stage2_mips=False and "
                 "the integrated retrieval pipeline"
             )
+        if no_compression:
+            if documents is not None or oracle_gold_indices is not None:
+                raise ValueError(
+                    "ARIA-NoComp supports only Normal full-corpus retrieval"
+                )
+            if self.generation_top_k != 5:
+                raise ValueError("ARIA-NoComp requires the paper's top-5 decoder ceiling")
+            if not all(
+                (
+                    self._rag_config.use_qca,
+                    self._rag_config.use_ahr,
+                    self._rag_config.use_igfr,
+                    self._rag_config.use_mads,
+                    self._rag_config.use_ccef,
+                )
+            ):
+                raise ValueError(
+                    "ARIA-NoComp requires all five first-pass retrieval stages"
+                )
+            if (
+                self._rag_config.use_cfrs
+                or self._rag_config.acr_allocation_mode != "full"
+                or self._rag_config.second_retrieval_mode != "disabled"
+            ):
+                raise ValueError(
+                    "ARIA-NoComp runtime must disable CFRS, ACR, and MTFRL"
+                )
         if "query_reasoner_adapter" not in self.adapter_keys:
             raise ValueError("query_reasoner_adapter is required")
         if self.rag_pipeline is None:
@@ -4905,6 +5030,48 @@ class CLaRa(PreTrainedModel):
                 )
             query_time = time.perf_counter() - query_start
 
+            if no_compression:
+                generation_start = time.perf_counter()
+                (
+                    decoded,
+                    prompt_lengths,
+                    document_token_counts,
+                    context_limit,
+                ) = self._generate_no_compression_context(
+                    questions,
+                    initial_evidence,
+                    max_new_tokens,
+                )
+                generate_time = time.perf_counter() - generation_start
+                for row_index, diag in enumerate(diagnostics):
+                    diag.final_candidates = len(initial_evidence[row_index])
+                    diag.second_round_candidates = 0
+                    diag.evidence_memory_tokens = 0
+                    diag.direct_context_document_tokens = int(
+                        document_token_counts[row_index].item()
+                    )
+                    diag.direct_context_prompt_tokens = int(
+                        prompt_lengths[row_index].item()
+                    )
+                    diag.direct_context_ceiling = context_limit
+                elapsed_ms = (time.perf_counter() - overall_start) * 1000.0
+                for diag in diagnostics:
+                    diag.latency_ms = elapsed_ms / max(len(diagnostics), 1)
+                    self._rag_diagnostics.append(diag)
+                if len(self._rag_diagnostics) > 1000:
+                    self._rag_diagnostics = self._rag_diagnostics[-500:]
+                if time_count:
+                    total = query_time + generate_time
+                    return (
+                        decoded,
+                        first_pass_indices,
+                        0.0,
+                        query_time,
+                        generate_time,
+                        total,
+                    )
+                return decoded, first_pass_indices
+
             # Algorithm 1 lines 9-10: first ACR and compression on first CCEF D1.
             compression_start = time.perf_counter()
             first_pass = self._compress_evidence(
@@ -4920,11 +5087,7 @@ class CLaRa(PreTrainedModel):
                 # no-MTFRL controls preserve D2=200 and union->MADS->CCEF with
                 # the release's static original-QR/W_BGE query convention.
                 if self._rag_config.second_retrieval_mode == "memory_feedback":
-                    second_query = self._compute_mtfrl_feedback_query(
-                        first_pass["memory"],
-                        first_pass["effective_counts"],
-                        document_mask=first_pass["document_mask"],
-                    )
+                    second_query = self._compute_first_pass_feedback_query(first_pass)
                 elif self._rag_config.second_retrieval_mode == "static_query":
                     second_query = query_bge
                 else:
@@ -5649,8 +5812,8 @@ class CLaRa(PreTrainedModel):
         return prompt_len, response
 
     def _blend_paraphrase_prompt(
-        self, docs: str, instruction: str, answer: str
-    ) -> Tuple[int, str]:
+        self, docs: str, instruction: str, answer: Optional[str]
+    ) -> Union[str, Tuple[int, str]]:
         """Create the Phase-I conditional-generation prompt from its given I."""
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("Phase-I paraphrase rows require their source instruction")
@@ -5697,7 +5860,9 @@ class CLaRa(PreTrainedModel):
 
         return prompt_len, response
 
-    def _blend_standard_prompt(self, docs: str, query: str, answer: str) -> Tuple[int, str]:
+    def _blend_standard_prompt(
+        self, docs: str, query: str, answer: Optional[str]
+    ) -> Union[str, Tuple[int, str]]:
         """Create standard prompt for stage 1_2."""
         prompt_system = 'You are a helpful assistant. Your task is to extract relevant information from provided documents and to answer to questions as briefly as possible.'
         prompt_user = f"Background:\n{docs}\n\nQuestion:{query}"
@@ -6285,12 +6450,29 @@ class CLaRa(PreTrainedModel):
                 )
         if strict_aria_artifacts and source_config_dict is not None:
             serialized_stage = source_config_dict["training_stage"]
+            if (
+                source_config_dict.get("aria_likelihood_reduction")
+                != ARIA_LIKELIHOOD_REDUCTION
+            ):
+                raise ValueError(
+                    "Strict checkpoint config requires likelihood reduction "
+                    f"{ARIA_LIKELIHOOD_REDUCTION!r}"
+                )
             if serialized_stage == "stage2":
                 required_protocol = {
-                    "cfrs_reconstruction_scheme": CFRS_RECONSTRUCTION_SCHEME,
-                    "cfrs_reconstruction_chunk_tokens": 128,
+                    "cfrs_fidelity_scheme": CFRS_FIDELITY_SCHEME,
+                    "retrieval_straight_through_scheme": (
+                        RETRIEVAL_STRAIGHT_THROUGH_SCHEME
+                    ),
+                    "acr_training_gate": source_config_dict.get(
+                        "acr_training_gate"
+                    ),
                     "mtfrl_initialization_scheme": MTFRL_INITIALIZATION_SCHEME,
                 }
+                if required_protocol["acr_training_gate"] not in {"soft", "hard_st"}:
+                    raise ValueError(
+                        "Strict checkpoint config must serialize a valid acr_training_gate"
+                    )
                 for key, expected in required_protocol.items():
                     if key not in source_config_dict:
                         raise ValueError(
@@ -6304,6 +6486,22 @@ class CLaRa(PreTrainedModel):
                 rag_configuration = source_config_dict.get(
                     "aria_rag_configuration"
                 )
+                if (
+                    source_config_dict.get("aria_acr_training_gate")
+                    != required_protocol["acr_training_gate"]
+                ):
+                    raise ValueError(
+                        "Strict checkpoint config has inconsistent ACR "
+                        "training-gate metadata"
+                    )
+                expected_loss_weights = {
+                    "lambda_mse": 0.0 if rag_configuration == "clara_baseline" else 0.10
+                }
+                if source_config_dict.get("aria_loss_weights") != expected_loss_weights:
+                    raise ValueError(
+                        "Strict checkpoint config has inconsistent Phase-II "
+                        f"objective metadata; expected {expected_loss_weights!r}"
+                    )
                 if rag_configuration not in {
                     "remove_mtfrl",
                     "static_second_retrieval",
@@ -6780,7 +6978,11 @@ class CLaRa(PreTrainedModel):
             labels=labels,
             memory_token_counts=memory_token_counts,
         )
-        return out["loss"], {"logits": out["logits"], "mse_loss": out["mse_loss"]}
+        return out["loss"], {
+            "logits": out["logits"],
+            "mse_loss": out["mse_loss"],
+            "target_token_count": out["target_token_count"],
+        }
 
     def _compute_qa_lmse(
         self,
@@ -6835,7 +7037,7 @@ class CLaRa(PreTrainedModel):
         stage2_mips: bool,
         stage2_retrieval_top_n: Optional[int],
     ) -> Tuple[torch.Tensor, Dict]:
-        """Paper-faithful Phase II with all five losses in Eq. (13)."""
+        """Paper Phase II: QA plus coordinate hidden-state MSE."""
         if getattr(self.config, "aria_rag_configuration", None) == "clara_baseline":
             return self._forward_clara_baseline_batch(batch)
         if stage2_mips:
@@ -6891,17 +7093,12 @@ class CLaRa(PreTrainedModel):
         feedback: Optional[torch.Tensor] = None
         if self._mtfrl is not None:
             if self._rag_config.second_retrieval_mode == "memory_feedback":
-                feedback = self._compute_mtfrl_feedback_query(
-                    first_pass["memory"],
-                    gates=first_pass["gates"],
-                    base_counts=first_pass["base_counts"],
-                    document_mask=first_pass["document_mask"],
-                )
+                feedback = self._compute_first_pass_feedback_query(first_pass)
                 second_query = feedback
             elif self._rag_config.second_retrieval_mode == "static_query":
                 # Release convention for the topology-matched control: reuse
                 # the original QR representation after frozen W_BGE projection.
-                # ``feedback`` intentionally remains None, so L_MTFRL is zero.
+                # ``feedback`` remains None because this control uses QR directly.
                 second_query = query_bge
             else:
                 raise RuntimeError("mounted second retriever has disabled mode")
@@ -6937,28 +7134,7 @@ class CLaRa(PreTrainedModel):
             final_evidence = initial_evidence
             final_pass = first_pass
 
-        qr_loss, mtfrl_loss, selected_positive_ids = self._retrieval_auxiliary_losses(
-            batch,
-            initial_evidence,
-            query_bge,
-            feedback,
-        )
-        cfrs_loss = (
-            (
-                (
-                    final_pass["per_doc_mse"]
-                    * final_pass["document_mask"].to(
-                        final_pass["per_doc_mse"].dtype
-                    )
-                ).sum(dim=1)
-                / final_pass["document_mask"].sum(dim=1)
-            ).mean()
-            if self._cfrs is not None
-            else final_pass["memory"].sum() * 0.0
-        )
-
-        # Ordering consumes a stopped-gradient score copy.  L_CFRS above is the
-        # sole CFRS gradient path into the compressor.
+        # CFRS is a detached forward-path ordering operation, not a loss term.
         final_scores = CompressionFidelityReranker.rerank(
             final_pass["fused_scores"],
             final_pass["per_doc_mse"],
@@ -6969,11 +7145,17 @@ class CLaRa(PreTrainedModel):
         hard_order = torch.argsort(
             final_scores.detach(), dim=-1, descending=True, stable=True
         )
-        _, _, n_tokens, hidden = final_pass["memory"].shape
+        selected_doc_st_memory = self._apply_selected_doc_cosine_identity_st(
+            final_pass["memory"],
+            final_evidence,
+            query_bge,
+            feedback,
+        )
+        _, _, n_tokens, hidden = selected_doc_st_memory.shape
         memory_index = hard_order.unsqueeze(-1).unsqueeze(-1).expand(
             batch_size, n_docs, n_tokens, hidden
         )
-        selected = final_pass["memory"].gather(1, memory_index)
+        selected = selected_doc_st_memory.gather(1, memory_index)
         ordered_context_counts = final_pass["context_counts"].gather(
             1, hard_order
         )
@@ -7037,18 +7219,15 @@ class CLaRa(PreTrainedModel):
             final_pass["ratios"].detach() * valid_float
         ).sum() / valid_float.sum()
         self._set_all_adapters()
-        return dec_out.loss, {
-            "logits": dec_out.logits,
-            "topk_idx": topk_idx,
-            "topk_doc_ids": topk_doc_ids,
-            "mse_loss": lmse_loss,
-            "cfrs_loss": cfrs_loss,
-            "qr_loss": qr_loss,
-            "mtfrl_loss": mtfrl_loss,
-            "cfrs_error": cfrs_error_metric,
-            "acr_ratio": acr_ratio_metric,
-            "retrieval_positive_ids": selected_positive_ids,
-        }
+        return dec_out.loss, _likelihood_outputs(
+            labels,
+            logits=dec_out.logits,
+            topk_idx=topk_idx,
+            topk_doc_ids=topk_doc_ids,
+            mse_loss=lmse_loss,
+            cfrs_error=cfrs_error_metric,
+            acr_ratio=acr_ratio_metric,
+        )
 
     def _forward_clara_baseline_batch(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """Appendix-A.37 CLaRa Phase II, isolated from the ARIA pipeline."""
@@ -7140,62 +7319,23 @@ class CLaRa(PreTrainedModel):
         )
         self.decoder.set_adapter(["query_reasoner_adapter", "decoder_adapter"])
         zero = dec_out.loss * 0.0
-        return dec_out.loss, {
-            "logits": dec_out.logits,
-            "topk_idx": topk_idx,
-            "selector_scores": selector_scores,
-            "selector_weights": selector_weights,
-            "mse_loss": zero,
-            "cfrs_loss": zero,
-            "qr_loss": zero,
-            "mtfrl_loss": zero,
-        }
-
-    def _forward_stage2_pretrain_batch(self, batch: Dict, stage2_mips: bool, stage2_retrieval_top_n: int) -> Tuple[torch.Tensor, Dict]:
-        """Compatibility entry point that directs training to ARIA Phase II."""
-        raise RuntimeError("ARIA Phase-II training requires _forward_stage2_batch()")
-        self.decoder.set_adapter('query_reasoner_adapter')
-
-        B = batch["labels"].shape[0]
-        N = batch["enc_input_ids"].shape[0] // B
-        device = self.decoder.device
-
-        query_reps = self._compr_query_reasoner_stage2(
-            batch["query_input_ids"].to(device),
-            batch["query_attention_mask"].to(device)
+        return dec_out.loss, _likelihood_outputs(
+            labels,
+            logits=dec_out.logits,
+            topk_idx=topk_idx,
+            selector_scores=selector_scores,
+            selector_weights=selector_weights,
+            mse_loss=zero,
         )
 
-        enc_input_ids = batch["enc_input_ids"].to(device)
-        enc_attention_mask = batch["enc_attention_mask"].to(device)
-
-        with torch.no_grad():
-            retrieved_doc_embeddings, mse_loss = self.compress(enc_input_ids, enc_attention_mask)
-
-        stage2_retrieval_top_n = retrieved_doc_embeddings.shape[0] // B
-        retrieved_doc_embeddings = retrieved_doc_embeddings.reshape(B, stage2_retrieval_top_n, -1)
-        query_reps = query_reps.to(retrieved_doc_embeddings.dtype)
-
-        scores = torch.bmm(
-            F.normalize(query_reps, dim=-1, p=2).unsqueeze(1).float(),
-            F.normalize(retrieved_doc_embeddings, dim=-1, p=2).float().transpose(1, 2)
-        ).squeeze(1)
-
-        pos_index = batch["pos_index"]
-        pos_mask = build_pos_mask(pos_index, N, device)
-        tau = 0.02
-        logits = scores / tau
-
-        pos_logits = logits.masked_fill(~pos_mask, float('-inf'))
-        num = torch.logsumexp(pos_logits, dim=-1)
-        den = torch.logsumexp(logits, dim=-1)
-        loss_vec = -(num - den)
-        valid = pos_mask.any(dim=-1)
-        loss = loss_vec[valid].mean()
-
-        topk = self.generation_top_k
-        topk_idx = logits.topk(k=min(topk, N), dim=-1).indices
-
-        return loss, {"logits": [[]], "topk_idx": topk_idx, "mse_loss": mse_loss}
+    def _forward_stage2_pretrain_batch(
+        self,
+        batch: Dict,
+        stage2_mips: bool,
+        stage2_retrieval_top_n: int,
+    ) -> Tuple[torch.Tensor, Dict]:
+        """Compatibility entry point that directs training to ARIA Phase II."""
+        raise RuntimeError("ARIA Phase-II training requires _forward_stage2_batch()")
 
     def _forward_stage2_reasoning_batch(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """Forward pass for stage 2 reasoning training."""
@@ -7303,8 +7443,11 @@ class CLaRa(PreTrainedModel):
 
         return {
             "loss": decoder_outputs.loss,
-            "logits": decoder_outputs.logits,
-            "mse_loss": mse_loss
+            **_likelihood_outputs(
+                labels,
+                logits=decoder_outputs.logits,
+                mse_loss=mse_loss,
+            ),
         }
 
     def _replace_reasoning_embeddings(self,

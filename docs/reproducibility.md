@@ -32,16 +32,21 @@ obtain those values from the release owner; this repository does not guess them.
 | Runs | `42, 123, 456, 789, 2024` in the supplied launch matrix |
 | LoRA | `q_proj`, rank 16, alpha 32, dropout 0.10, no bias |
 | Phase I | four-category 7,808,465-example conditional-generation mixture |
-| Phase II loss | `QA + .10 MSE + .10 CFRS + .05 QR + .05 MTFRL` |
+| Phase II loss | `QA + .10 MSE` |
+| Likelihood reduction | exact target-token mean over the physical data-parallel minibatch |
 | MADS semantic axis | normalized `W_BGE q_rep` vs. frozen BGE document vector |
-| CFRS | frozen-decoder teacher-forced next-token squared-probability proxy |
+| CFRS | per-document memory/non-memory hidden-mean coordinate MSE |
 | `P_fb` | two-layer GELU, Xavier-uniform weights, zero biases |
 | Retrieval | one MTFRL second round, 200 dense candidates |
+| Retrieval gradient | identity-valued selected-document cosine ST bridge |
+| ACR | soft training by default; hard threshold at inference |
 | Decoding | greedy, one beam, EOS or 64 generated tokens |
+| ARIA-NoComp | full Phase-II 16x checkpoint, up to five Normal first-pass raw passages |
 
-In particular, a MiniLM MADS encoder, latent cross-attention CFRS objective, or
-SVD-initialized feedback projection is a different method and must not be
-reported as the paper configuration.
+The QR and feedback searches remain hard in the forward pass. The ST bridge
+adds no objective term and changes no forward value. The independently trained
+hard-gate analysis uses `ACR_TRAINING_GATE=hard_st`; the main configuration
+uses `soft`.
 
 ## 3. Verify lengths and optimization
 
@@ -51,6 +56,7 @@ reported as the paper configuration.
 | Phase-I input / target maximum | 2,048 / 512 tokens |
 | Phase-II input / target maximum | 1,024 / 128 tokens |
 | Evaluation generation maximum | 64 tokens |
+| ARIA-NoComp context ceiling | no truncation; `min(32768, model, finite tokenizer)` |
 | Phase-I epochs / effective batch / LR | 3 / 128 / `1e-4` (Mistral/Llama) |
 | Phase-II epochs / effective batch / LR | 5 / 32 / `2e-4` (Mistral/Llama) |
 | Qwen effective batch / Phase-II LR | 16 / `1.6e-4` |
@@ -93,6 +99,24 @@ Then run each external-artifact integration job and save its exact command,
 environment, checkpoint path, manifest hashes, per-example predictions, and
 summary JSON. A five-run mean requires five independently trained checkpoints;
 repeated evaluation of one checkpoint is not a five-seed result.
+
+Reproduce the reported ARIA-NoComp row from the full Phase-II 16x checkpoints:
+
+```bash
+EVAL_DATA_PATH=/data/aria/eval \
+CORPUS_PATH=/data/kilt_corpus.jsonl \
+DOC_EMBEDDINGS='/data/{dataset}_kilt_bge.pt' \
+RAG_CONFIGURATION=no_compression \
+bash scripts/evaluate.sh 16
+```
+
+Verify that the output filename carries `cr1_sourcecr16`, retrieval mode is
+Normal, and `no_compression_protocol` records one five-stage round, no
+compression/couplings, greedy 64-token decoding, and the effective context
+ceiling. Every prediction must retain its first-pass corpus indices and direct
+document/prompt token counts. The reported approximately 590 tokens per passage
+and 2,950 raw context tokens per query are measured corpus statistics; do not
+enforce them through truncation.
 
 The main paper endpoint is 44.50 average token-level F1 at nominal 16x Normal
 retrieval with Mistral-7B over NQ, HotpotQA, MuSiQue, and 2WikiMultiHopQA.

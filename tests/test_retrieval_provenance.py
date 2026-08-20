@@ -14,6 +14,7 @@ from openrlhf.cli.evaluate_aria import (
     load_doc_embeddings,
 )
 from openrlhf.models.modeling_aria import (
+    ARIA_LIKELIHOOD_REDUCTION,
     CLARA_DOCUMENT_REPRESENTATION_SCHEME,
     CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
     CLARA_ARCHIVE_PAGE_ID_SCHEME,
@@ -21,9 +22,10 @@ from openrlhf.models.modeling_aria import (
     CLARA_MEMORY_ALLOCATION_SCHEME,
     CLARA_PHASE2_OBJECTIVE,
     CLARA_SELECTOR_SCHEME,
-    CFRS_RECONSTRUCTION_SCHEME,
+    CFRS_FIDELITY_SCHEME,
     MTFRL_INITIALIZATION_SCHEME,
     QR_INPUT_SCHEME,
+    RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
 )
 from openrlhf.utils.aria_provenance import (
     CORPUS_SHA256_SCHEME,
@@ -56,8 +58,11 @@ def _paper_checkpoint_model() -> SimpleNamespace:
         mtfrl_initialization_scheme=MTFRL_INITIALIZATION_SCHEME,
         mtfrl_initialization_rank=None,
         mtfrl_hidden_width=2048,
-        cfrs_reconstruction_scheme=CFRS_RECONSTRUCTION_SCHEME,
-        cfrs_reconstruction_chunk_tokens=128,
+        cfrs_fidelity_scheme=CFRS_FIDELITY_SCHEME,
+        retrieval_straight_through_scheme=RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
+        aria_acr_training_gate="soft",
+        aria_loss_weights={"lambda_mse": 0.10},
+        aria_likelihood_reduction=ARIA_LIKELIHOOD_REDUCTION,
         aria_compression_rate=16,
         aria_rag_configuration="full",
         aria_training_seed=42,
@@ -282,9 +287,6 @@ def test_checkpoint_protocol_accepts_only_canonical_clara_baseline():
     model.config.clara_archive_page_id_scheme = CLARA_ARCHIVE_PAGE_ID_SCHEME
     model.config.aria_loss_weights = {
         "lambda_mse": 0.0,
-        "lambda_cfrs": 0.0,
-        "lambda_qr": 0.0,
-        "lambda_mtfrl": 0.0,
     }
     model.config.aria_trainable_parameter_names = [
         "decoder.lora_A.query_reasoner_adapter.weight",
@@ -322,6 +324,19 @@ def test_checkpoint_protocol_requires_exact_base_decoder_revision():
     model = _paper_checkpoint_model()
     model.config.decoder_model_resolved_revision = None
     with pytest.raises(ValueError, match="exact resolved base-model revision"):
+        _validate_checkpoint_protocol(
+            model,
+            "checkpoint",
+            training_seed=42,
+            compression_rate=16,
+            expected_configuration="full",
+        )
+
+
+def test_checkpoint_protocol_requires_global_target_token_likelihood_reduction():
+    model = _paper_checkpoint_model()
+    model.config.aria_likelihood_reduction = "rank-local-token-mean"
+    with pytest.raises(ValueError, match="aria_likelihood_reduction"):
         _validate_checkpoint_protocol(
             model,
             "checkpoint",

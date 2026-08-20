@@ -8,11 +8,13 @@ from openrlhf.cli.counterfactual_decomposition import (
     _validate_counterfactual_checkpoint_sets,
 )
 from openrlhf.cli.evaluate_aria import (
+    _create_evaluation_rag_config,
     _required_checkpoint_configuration,
     _validate_checkpoint_protocol,
 )
 from openrlhf.cli.train_sft import create_argument_parser, validate_arguments
 from openrlhf.models.modeling_aria import (
+    ARIA_NO_COMPRESSION_CONFIGURATION,
     MATCHED_EVIDENCE_TOKEN_BUDGET,
     AdaptiveCompressionAllocator,
 )
@@ -38,7 +40,31 @@ def test_matched_remove_all_and_fixed_forward_path_are_distinct_protocols():
     assert forward_off.second_retrieval_mode == "disabled"
 
 
-def test_training_cli_accepts_matched_remove_all_and_zeros_only_disabled_losses():
+def test_no_compression_is_evaluation_only_and_reuses_full_checkpoint():
+    assert _required_checkpoint_configuration(
+        ARIA_NO_COMPRESSION_CONFIGURATION
+    ) == "full"
+    config = _create_evaluation_rag_config(
+        ARIA_NO_COMPRESSION_CONFIGURATION,
+        compression_rate=16,
+    )
+    assert all(
+        (config.use_qca, config.use_ahr, config.use_igfr, config.use_mads, config.use_ccef)
+    )
+    assert config.use_cfrs is False
+    assert config.acr_allocation_mode == "full"
+    assert config.second_retrieval_mode == "disabled"
+
+    training_parser = create_argument_parser()
+    rag_action = next(
+        action
+        for action in training_parser._actions
+        if action.dest == "rag_configuration"
+    )
+    assert ARIA_NO_COMPRESSION_CONFIGURATION not in rag_action.choices
+
+
+def test_training_cli_accepts_matched_remove_all_with_shared_two_term_objective():
     args = create_argument_parser().parse_args(
         [
             "--pretrain",
@@ -54,9 +80,9 @@ def test_training_cli_accepts_matched_remove_all_and_zeros_only_disabled_losses(
     with pytest.raises(ValueError, match="--dataset is required for training"):
         validate_arguments(args)
     assert args.lambda_mse == pytest.approx(0.10)
-    assert args.lambda_cfrs == 0.0
-    assert args.lambda_qr == pytest.approx(0.05)
-    assert args.lambda_mtfrl == 0.0
+    assert not hasattr(args, "lambda_cfrs")
+    assert not hasattr(args, "lambda_qr")
+    assert not hasattr(args, "lambda_mtfrl")
 
 
 def test_training_cli_rejects_fixed_forward_path_checkpoint_training():

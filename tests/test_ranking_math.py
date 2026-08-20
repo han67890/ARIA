@@ -120,6 +120,49 @@ def test_qca_h05_where_template_precedes_generic_where_splitter(monkeypatch):
     ]
 
 
+def test_qca_explicit_aspect_phrase_overrides_count_only_hop_rule(monkeypatch):
+    nlp = _FakeSpacyPipeline()
+    monkeypatch.setattr(modeling_aria, "_qca_get_spacy", lambda: nlp)
+
+    # Three entities activate the count-only H01 condition, but the manuscript
+    # evaluates explicit A01--A06 phrases first and lets them determine the
+    # route when the two rule families conflict.
+    result = QuestionComplexityAssessor().assess(
+        "Compare Alice, Bob, and Carol."
+    )
+
+    assert "A01" in result.matched_rules
+    assert result.question_type is QuestionType.MULTI_ASPECT
+
+
+def test_qca_explicit_hop_phrase_overrides_explicit_aspect_phrase(monkeypatch):
+    nlp = _FakeSpacyPipeline()
+    monkeypatch.setattr(modeling_aria, "_qca_get_spacy", lambda: nlp)
+
+    result = QuestionComplexityAssessor().assess(
+        "Compare Alice and Bob in which country they were born."
+    )
+
+    assert {"H02", "A01"}.issubset(result.matched_rules)
+    assert result.question_type is QuestionType.MULTI_HOP
+
+
+def test_qca_who_action_phrase_uses_entity_count_disambiguation(monkeypatch):
+    nlp = _FakeSpacyPipeline()
+    monkeypatch.setattr(modeling_aria, "_qca_get_spacy", lambda: nlp)
+    assessor = QuestionComplexityAssessor()
+
+    single = assessor.assess("Who wrote Alice?")
+    multiple = assessor.assess("Who wrote Alice about Bob?")
+
+    assert single.question_type is QuestionType.SIMPLE
+    assert "S03" in single.matched_rules
+    assert "H04" not in single.matched_rules
+    assert multiple.question_type is QuestionType.MULTI_HOP
+    assert "H04" in multiple.matched_rules
+    assert "S03" not in multiple.matched_rules
+
+
 def test_qca_starts_requires_a_token_boundary():
     assert modeling_aria._qca_starts("what is ada?", "what is")
     assert not modeling_aria._qca_starts("what island is ada on?", "what is")
@@ -231,53 +274,265 @@ def test_mtfrl_width_is_exactly_half_the_backbone_hidden_size():
     assert _mtfrl_hidden_width(3584, 1024) == 1792
 
 
-def test_cfrs_matches_teacher_forced_squared_probability_error():
-    logits = torch.tensor(
+def test_mtfrl_normalizes_the_document_balanced_mean_before_projection():
+    class _CaptureLinear(torch.nn.Linear):
+        def forward(self, values):
+            self.last_input = values.detach().clone()
+            return super().forward(values)
+
+    projection = _CaptureLinear(2, 2, bias=False)
+    with torch.no_grad():
+        projection.weight.copy_(torch.tensor([[2.0, 0.0], [1.0, 1.0]]))
+    model = CLaRa.__new__(CLaRa)
+    torch.nn.Module.__init__(model)
+    model._mtfrl_projection = torch.nn.Sequential(projection)
+    model._rag_config = SimpleNamespace(numerical_epsilon=1e-6)
+    memory = torch.tensor(
         [
-            [[2.0, 0.0, -1.0], [0.1, 0.2, 0.3], [1.0, -1.0, 0.0]],
-            [[-0.5, 0.5, 1.5], [3.0, 0.0, -2.0], [0.0, 0.0, 0.0]],
+            [
+                [[3.0, 0.0], [99.0, 99.0]],
+                [[0.0, 1.0], [0.0, 1.0]],
+            ]
+        ]
+    )
+    counts = torch.tensor([[1, 2]])
+
+    actual = model._compute_mtfrl_feedback_query(
+        memory,
+        effective_counts=counts,
+        document_mask=torch.tensor([[True, True]]),
+    )
+
+    pooled = torch.tensor([[1.5, 0.5]])
+    normalized_input = torch.nn.functional.normalize(pooled, dim=-1)
+    projected = normalized_input @ projection.weight.detach().T
+    assert torch.allclose(projection.last_input, normalized_input)
+    assert torch.allclose(
+        actual,
+        torch.nn.functional.normalize(projected, dim=-1),
+    )
+
+
+def test_first_pass_feedback_uses_soft_pooling_only_while_training():
+    model = CLaRa.__new__(CLaRa)
+    torch.nn.Module.__init__(model)
+    calls = []
+
+    def capture(memory, effective_counts=None, gates=None, base_counts=None,
+                document_mask=None):
+        calls.append(
+            {
+                "memory": memory,
+                "effective_counts": effective_counts,
+                "gates": gates,
+                "base_counts": base_counts,
+                "document_mask": document_mask,
+            }
+        )
+        return torch.tensor([[1.0, 0.0]])
+
+    model._compute_mtfrl_feedback_query = capture
+    first_pass = {
+        "memory": torch.randn(1, 2, 3, 4),
+        "gates": torch.rand(1, 2, 3),
+        "base_counts": torch.tensor([[3, 3]]),
+        "effective_counts": torch.tensor([[1, 2]]),
+        "document_mask": torch.tensor([[True, True]]),
+    }
+
+    model.train()
+    model._compute_first_pass_feedback_query(first_pass)
+    assert calls[-1]["gates"] is first_pass["gates"]
+    assert calls[-1]["base_counts"] is first_pass["base_counts"]
+    assert calls[-1]["effective_counts"] is None
+
+    model.eval()
+    model._compute_first_pass_feedback_query(first_pass)
+    assert calls[-1]["effective_counts"] is first_pass["effective_counts"]
+    assert calls[-1]["gates"] is None
+    assert calls[-1]["base_counts"] is None
+
+
+def test_cfrs_is_masked_hidden_mean_coordinate_mse():
+    memory_hidden = torch.tensor(
+        [
+            [[1.0, 3.0], [3.0, 5.0], [100.0, 100.0]],
+            [[-1.0, 1.0], [100.0, 100.0], [3.0, 5.0]],
         ],
         requires_grad=True,
     )
-    target_ids = torch.tensor([[0, 2, 1], [2, 0, 1]])
-    target_mask = torch.tensor([[True, True, False], [True, False, True]])
+    memory_mask = torch.tensor(
+        [[True, True, False], [True, False, True]]
+    )
+    non_memory_hidden = torch.tensor(
+        [
+            [[0.0, 0.0], [2.0, 2.0], [100.0, 100.0], [100.0, 100.0]],
+            [[0.0, 1.0], [2.0, 1.0], [100.0, 100.0], [100.0, 100.0]],
+        ],
+        requires_grad=True,
+    )
+    non_memory_mask = torch.tensor(
+        [[True, True, False, False], [True, True, False, False]]
+    )
 
-    actual = CompressionFidelityReranker.squared_probability_error(
-        logits, target_ids, target_mask
+    actual = CompressionFidelityReranker.hidden_mean_coordinate_mse(
+        memory_hidden,
+        memory_mask,
+        non_memory_hidden,
+        non_memory_mask,
     )
-    probabilities = logits.softmax(dim=-1)
-    targets = torch.nn.functional.one_hot(
-        target_ids, num_classes=logits.size(-1)
-    ).to(probabilities)
-    per_token = (probabilities - targets).square().sum(dim=-1)
-    expected = torch.stack(
-        [per_token[0, :2].mean(), per_token[1, [0, 2]].mean()]
-    )
+    expected = torch.tensor([5.0, 2.0])
 
     assert torch.allclose(actual, expected, atol=1e-7, rtol=0)
     actual.sum().backward()
-    assert logits.grad is not None and logits.grad.abs().sum() > 0
+    assert memory_hidden.grad is not None
+    assert non_memory_hidden.grad is not None
+    assert memory_hidden.grad[memory_mask].abs().sum() > 0
+    assert non_memory_hidden.grad[non_memory_mask].abs().sum() > 0
+    assert torch.count_nonzero(memory_hidden.grad[~memory_mask]) == 0
+    assert torch.count_nonzero(non_memory_hidden.grad[~non_memory_mask]) == 0
 
 
-def test_cfrs_probability_error_validates_teacher_forcing_targets():
-    logits = torch.ones(2, 3, 5)
-    targets = torch.ones(2, 3, dtype=torch.long)
-    with pytest.raises(ValueError, match="align with logits"):
-        CompressionFidelityReranker.squared_probability_error(
-            logits, targets[:, :2]
-        )
-    with pytest.raises(ValueError, match="integer dtype"):
-        CompressionFidelityReranker.squared_probability_error(
-            logits, targets.float()
-        )
-    with pytest.raises(ValueError, match="same shape"):
-        CompressionFidelityReranker.squared_probability_error(
-            logits, targets, torch.ones(2, 2, dtype=torch.bool)
-        )
-    with pytest.raises(ValueError, match="at least one target token"):
-        CompressionFidelityReranker.squared_probability_error(
-            logits, targets, torch.zeros_like(targets, dtype=torch.bool)
-        )
+def test_cfrs_soft_gate_mean_is_normalized_by_valid_gate_mass():
+    memory_hidden = torch.tensor(
+        [[[2.0, 0.0], [0.0, 4.0], [100.0, 100.0]]],
+        requires_grad=True,
+    )
+    memory_mask = torch.tensor([[True, True, False]])
+    memory_weights = torch.tensor(
+        [[1.0, 0.25, 1_000_000.0]],
+        requires_grad=True,
+    )
+    non_memory_hidden = torch.zeros(1, 1, 2, requires_grad=True)
+    non_memory_mask = torch.tensor([[True]])
+
+    actual = CompressionFidelityReranker.hidden_mean_coordinate_mse(
+        memory_hidden,
+        memory_mask,
+        non_memory_hidden,
+        non_memory_mask,
+        memory_weights=memory_weights,
+    )
+
+    # The valid weighted mean is [1.6, 0.8], not the count-diluted [1.0, 0.5].
+    assert torch.allclose(actual, torch.tensor([1.6]), atol=1e-6, rtol=0)
+    assert not torch.allclose(actual, torch.tensor([0.625]))
+    actual.sum().backward()
+    assert memory_weights.grad is not None
+    assert memory_weights.grad[0, :2].abs().sum() > 0
+    assert memory_weights.grad[0, 2].item() == 0.0
+    assert torch.count_nonzero(memory_hidden.grad[0, 2]) == 0
+
+
+def test_cfrs_per_document_wrapper_preserves_flat_source_alignment():
+    model = CLaRa.__new__(CLaRa)
+    torch.nn.Module.__init__(model)
+    memory = torch.tensor(
+        [[
+            [[1.0, 3.0], [3.0, 5.0], [99.0, 99.0]],
+            [[3.0, 1.0], [99.0, 99.0], [99.0, 99.0]],
+        ]]
+    )
+    counts = torch.tensor([[2, 1]])
+    source_hidden = torch.tensor(
+        [
+            [[0.0, 0.0], [2.0, 2.0], [99.0, 99.0], [99.0, 99.0]],
+            [[99.0, 99.0], [1.0, 1.0], [99.0, 99.0], [3.0, 1.0]],
+        ]
+    )
+    source_mask = torch.tensor(
+        [[True, True, False, False], [False, True, False, True]]
+    )
+
+    actual = model._compute_cfrs_errors(
+        memory,
+        counts,
+        source_hidden,
+        source_mask,
+    )
+
+    assert actual.shape == (1, 2)
+    assert torch.allclose(actual, torch.tensor([[5.0, 0.5]]))
+
+
+def test_cfrs_per_document_wrapper_uses_soft_gate_mass_not_token_count():
+    model = CLaRa.__new__(CLaRa)
+    torch.nn.Module.__init__(model)
+    memory = torch.tensor(
+        [[[[2.0, 0.0], [0.0, 4.0], [100.0, 100.0]]]]
+    )
+    counts = torch.tensor([[2]])
+    weights = torch.tensor([[[1.0, 0.25, 1_000_000.0]]])
+    source_hidden = torch.tensor([[[0.0, 0.0], [99.0, 99.0]]])
+    source_mask = torch.tensor([[True, False]])
+
+    actual = model._compute_cfrs_errors(
+        memory,
+        counts,
+        source_hidden,
+        source_mask,
+        memory_weights=weights,
+    )
+
+    assert actual.shape == (1, 1)
+    assert torch.allclose(actual, torch.tensor([[1.6]]), atol=1e-6, rtol=0)
+
+
+def test_compressor_fidelity_context_excludes_special_and_padding_positions():
+    class _FixedHiddenDecoder(torch.nn.Module):
+        def __init__(self, hidden_states):
+            super().__init__()
+            self.register_buffer("fixed_hidden_states", hidden_states)
+
+        def set_adapter(self, adapter_name):
+            self.active_adapter = adapter_name
+
+        def forward(self, **_kwargs):
+            return SimpleNamespace(hidden_states=(self.fixed_hidden_states,))
+
+    hidden = torch.tensor(
+        [[
+            [50.0, 50.0],
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [100.0, 100.0],
+            [7.0, 8.0],
+        ]]
+    )
+    model = CLaRa.__new__(CLaRa)
+    torch.nn.Module.__init__(model)
+    model.compr = None
+    model.adapter_keys = {"encoder_adapter"}
+    model.n_mem_tokens = 2
+    model.decoder = _FixedHiddenDecoder(hidden)
+    model.decoder_tokenizer = SimpleNamespace(
+        mem_token_ids_pt=torch.tensor([90, 91]),
+        all_special_ids=[0, 1, 90, 91],
+    )
+    input_ids = torch.tensor([[1, 10, 90, 91, 0, 11]])
+    attention_mask = torch.tensor([[1, 1, 1, 1, 0, 1]])
+
+    (
+        compressed,
+        _mse,
+        _compatibility,
+        source_hidden,
+        source_non_memory_mask,
+        memory_counts,
+    ) = model._compress_with_fidelity(
+        input_ids,
+        attention_mask,
+        return_alignment_context=True,
+    )
+
+    assert torch.equal(
+        source_non_memory_mask,
+        torch.tensor([[False, True, False, False, False, True]]),
+    )
+    assert memory_counts.tolist() == [2]
+    assert torch.equal(compressed, hidden[:, 2:4])
+    assert not source_hidden.requires_grad
 
 
 def test_oracle_top100_tail_injection_preserves_order_and_gold_annotation_order():
@@ -693,6 +948,48 @@ def test_acr_singleton_and_multi_document_tie_follow_paper_cases():
     assert tied.tolist() == [[0.625, 0.625, 0.625]]
 
 
+def test_acr_hard_st_is_hard_forward_and_sigmoid_backward():
+    allocator = AdaptiveCompressionAllocator(
+        min_ratio=0.25,
+        max_ratio=1.0,
+        beta=10.0,
+    )
+    embeddings = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])
+    base_counts = torch.tensor([4])
+
+    soft_ratio = torch.tensor([0.62], requires_grad=True)
+    soft, _, _ = allocator.apply_ratios(
+        embeddings,
+        soft_ratio,
+        base_token_counts=base_counts,
+        training_gate_mode="soft",
+    )
+    soft_gradient = torch.autograd.grad(soft.sum(), soft_ratio)[0]
+
+    hard_ratio = torch.tensor([0.62], requires_grad=True)
+    hard_st, applied_gates, effective_counts = allocator.apply_ratios(
+        embeddings,
+        hard_ratio,
+        base_token_counts=base_counts,
+        training_gate_mode="hard_st",
+    )
+
+    # floor(0.62 * 4) == 2: the forward tensor is the exact inference tensor.
+    assert torch.equal(
+        hard_st.detach(),
+        torch.tensor([[[1.0], [2.0], [0.0], [0.0]]]),
+    )
+    assert torch.equal(
+        applied_gates.detach(),
+        torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+    )
+    assert effective_counts.tolist() == [2]
+
+    hard_gradient = torch.autograd.grad(hard_st.sum(), hard_ratio)[0]
+    assert hard_gradient.abs().item() > 0
+    assert torch.allclose(hard_gradient, soft_gradient, atol=1e-7, rtol=0)
+
+
 def test_chunked_dense_search_matches_full_matrix_topk():
     queries = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     corpus = torch.tensor(
@@ -957,7 +1254,7 @@ def test_base_slot_pruning_preserves_acr_soft_gate_after_effective_floor():
     assert raw_memory.grad[0, 3].abs().sum() > 0
 
 
-def test_discrete_retrieval_scores_are_detached_from_qr_and_mtfrl():
+def _selected_document_st_fixture():
     model = CLaRa.__new__(CLaRa)
     torch.nn.Module.__init__(model)
     model._rag_config = RAGPipelineConfig(use_mads=False)
@@ -966,6 +1263,11 @@ def test_discrete_retrieval_scores_are_detached_from_qr_and_mtfrl():
             dense_embeddings=torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         )
     )
+    return model
+
+
+def test_selected_document_identity_st_is_exact_and_trains_qr_without_feedback():
+    model = _selected_document_st_fixture()
     evidence = [[
         _ScoredDoc(
             doc_id="0",
@@ -974,20 +1276,90 @@ def test_discrete_retrieval_scores_are_detached_from_qr_and_mtfrl():
             fused_score=0.2,
             from_second_round=False,
         ),
+    ]]
+    memory = torch.tensor(
+        [[[[1.0, 2.0, 3.0], [0.5, 1.0, 1.5]]]],
+        requires_grad=True,
+    )
+    qr_output = torch.tensor([[0.6, 0.8]], requires_grad=True)
+
+    selected = model._apply_selected_doc_cosine_identity_st(
+        memory,
+        evidence,
+        qr_output,
+    )
+
+    # Retrieval stays a hard, identity-preserving forward operation: the
+    # reader receives exactly the selected memory, with no score rescaling.
+    assert torch.equal(selected.detach(), memory.detach())
+    selected.sum().backward()
+    assert qr_output.grad is not None and qr_output.grad.abs().sum() > 0
+
+
+def test_selected_document_identity_st_trains_qr_and_pfb_but_ignores_pad_slots():
+    model = _selected_document_st_fixture()
+    evidence = [[
         _ScoredDoc(
             doc_id="1",
-            text="second",
+            text="second-round",
             corpus_index=1,
             fused_score=0.8,
             from_second_round=True,
         ),
     ]]
-    query = torch.tensor([[0.8, 0.2]], requires_grad=True)
-    feedback = torch.tensor([[0.3, 0.7]], requires_grad=True)
 
-    scores = model._differentiable_fused_scores(query, evidence, feedback)
+    def gradients(padding_value):
+        memory = torch.tensor(
+            [[
+                [[1.0, 2.0, 3.0], [0.5, 1.0, 1.5]],
+                [[padding_value] * 3, [padding_value] * 3],
+            ]]
+        )
+        qr_output = torch.tensor([[0.6, 0.8]], requires_grad=True)
+        pfb_output = torch.tensor([[0.8, 0.6]], requires_grad=True)
+        selected = model._apply_selected_doc_cosine_identity_st(
+            memory,
+            evidence,
+            qr_output,
+            pfb_output,
+        )
+        assert torch.equal(selected.detach(), memory)
+        loss = selected.sum()
+        return torch.autograd.grad(loss, (qr_output, pfb_output))
 
-    assert torch.equal(scores.detach(), torch.tensor([[0.2, 0.8]]))
-    assert not scores.requires_grad
-    assert query.grad is None
-    assert feedback.grad is None
+    zero_pad_gradients = gradients(0.0)
+    huge_pad_gradients = gradients(1_000_000.0)
+
+    expected = (
+        torch.tensor([[-4.32, 3.24]]),
+        torch.tensor([[-4.32, 5.76]]),
+    )
+    for zero_pad, huge_pad, expected_gradient in zip(
+        zero_pad_gradients,
+        huge_pad_gradients,
+        expected,
+    ):
+        assert zero_pad.abs().sum() > 0
+        assert torch.allclose(zero_pad, huge_pad, atol=1e-7, rtol=0)
+        # QR and P_fb each own an identity-valued ST factor.  Averaging their
+        # cosine surrogates would halve these gradients and violate the method.
+        assert torch.allclose(zero_pad, expected_gradient, atol=1e-6, rtol=0)
+
+
+def test_selected_document_identity_st_rejects_non_corpus_evidence():
+    model = _selected_document_st_fixture()
+    evidence = [[
+        _ScoredDoc(
+            doc_id="external",
+            text="not in the fixed index",
+            corpus_index=-1,
+            fused_score=1.0,
+        ),
+    ]]
+
+    with pytest.raises(ValueError, match="corpus-backed"):
+        model._apply_selected_doc_cosine_identity_st(
+            torch.ones(1, 1, 1, 3),
+            evidence,
+            torch.tensor([[0.6, 0.8]]),
+        )

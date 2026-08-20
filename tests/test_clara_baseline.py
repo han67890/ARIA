@@ -95,7 +95,7 @@ def test_clara_config_does_not_confuse_literal_all_linear_list_with_sentinel():
     assert config.lora_target_modules == ["all-linear"]
 
 
-def test_clara_phase2_cli_makes_all_auxiliary_coefficients_zero(
+def test_clara_phase2_cli_uses_qa_only_and_has_no_retired_auxiliary_terms(
     tmp_path, monkeypatch
 ):
     dataset = tmp_path / "phase2"
@@ -137,6 +137,6 @@ def test_clara_phase2_cli_makes_all_auxiliary_coefficients_zero(
     validate_arguments(args)
 
     assert args.lambda_mse == 0.0
-    assert args.lambda_cfrs == 0.0
-    assert args.lambda_qr == 0.0
-    assert args.lambda_mtfrl == 0.0
+    assert not hasattr(args, "lambda_cfrs")
+    assert not hasattr(args, "lambda_qr")
+    assert not hasattr(args, "lambda_mtfrl")

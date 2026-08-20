@@ -5,7 +5,7 @@
 ### Score- and Memory-Conditioned Retrieval and Compression for Latent-Compression Retrieval-Augmented Generation
 
 [![Python](https://img.shields.io/badge/python-3.10%E2%80%933.11-3776ab.svg)](pyproject.toml)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-mixed%20AML%20%2B%20Apache--2.0%20%2B%20CC--BY--NC--4.0-lightgrey.svg)](#license-and-attribution)
 
 </div>
@@ -41,11 +41,10 @@ query
 
 The three retrieval--compression operations are:
 
-- **CFRS (compression → retrieval):** a frozen base decoder computes a
-  teacher-forced next-token squared-probability error for each final passage.
-  Reverse min--max-normalized, detached errors are blended into the final
-  ordering with weight `0.30`; their undetached values form the compressor's
-  CFRS auxiliary loss.
+- **CFRS (compression → retrieval):** each final passage receives a fidelity
+  score from the coordinate mean squared distance between its mean memory and
+  non-memory compressor states. Reverse min--max-normalized errors are blended
+  into the final ordering with weight `0.30`.
 - **ACR (retrieval → compression):** CCEF relevance sets each document's
   scale in `[0.25, 1.0]`; a sigmoid gate with `beta=10` softly masks memory
   positions in training and a `0.5` threshold produces the hard inference
@@ -60,11 +59,13 @@ Paraphrase, and Entity-Augmented mixture. Phase II trains the QR, compressor,
 and generator LoRA adapters plus every parameter of the feedback projection:
 
 ```text
-L = L_QA + 0.10 L_MSE + 0.10 L_CFRS + 0.05 L_QR + 0.05 L_MTFRL
+L = L_QA + 0.10 L_MSE
 ```
 
 The language-model bases, pre-fitted `W_BGE`, BGE encoder/index, rules, and
-hard selection operations remain frozen or discrete. See
+hard selection operations remain frozen or discrete. Identity-valued
+selected-document cosine bridges preserve the hard forward path while carrying
+QA/MSE gradients to QR and the feedback projection. See
 [the method contract](docs/method.md) and [training guide](docs/training.md) for
 the exact equations, loss paths, pool sizes, and defaults.
 
@@ -181,7 +182,7 @@ The launchers enforce the paper's length contract: passage/query maxima
 `768/256`, Phase-I input/target maxima `2048/512`, Phase-II input/target maxima
 `1024/128`, and evaluation generation maximum `64`. They also fix the reported
 learning rates, warmup, effective batches, epoch counts, rank-16 `q_proj` LoRA,
-top-5 evidence, and all four Phase-II auxiliary weights. `scripts/train_all_cr.sh`
+top-5 evidence, and the Phase-II MSE weight. `scripts/train_all_cr.sh`
 expands ratios `{4,16,32,64,128}` and run seeds `{42,123,456,789,2024}`.
 
 ## Inference
@@ -221,6 +222,30 @@ answers, per-checkpoint benchmark averaging, and paired two-sided bootstrap.
 `aria-data --stage eval`. The external CLaRa ZIP members contain scalar answers
 only and are used solely as fingerprinted candidate pools; the evaluator never
 claims paper metrics from them or fabricates aliases.
+
+The paper's ARIA-NoComp diagnostic is an evaluator-only protocol. The reported
+row uses the five full Phase-II 16x checkpoints with Normal retrieval:
+
+```bash
+EVAL_DATA_PATH=/data/aria/eval \
+CORPUS_PATH=/data/kilt_corpus.jsonl \
+DOC_EMBEDDINGS='/data/{dataset}_kilt_bge.pt' \
+RAG_CONFIGURATION=no_compression \
+bash scripts/evaluate.sh 16
+```
+
+It runs the first QCA -> AHR -> IGFR -> MADS -> CCEF round, preserves the
+order of up to five survivors, joins those raw passages with two newlines, and feeds the
+standard QA prompt to the Phase-II decoder adapter as token IDs. It does not
+run compression, CFRS, ACR, or MTFRL. Decoding is greedy with one beam and at
+most 64 new tokens. Direct context is never truncated: the evaluator fails
+closed when the full prompt plus generation budget exceeds the smaller of the
+loaded model/tokenizer capacity and the fixed 32,768-token protocol ceiling.
+Results are labeled `cr1_sourcecr16` and record the first-pass corpus indices,
+effective ceiling, and mean raw-document/prompt token counts. The manuscript's
+approximately 590 tokens per passage and 2,950 raw context tokens per query are
+measurements, not truncation targets.
+
 It supports full-corpus Normal and a versioned Oracle top-100 protocol. Oracle
 retains the first BGE-ranked passage per canonical page URL, injects missing
 gold pages at the tail in annotation order, runs MADS/CCEF first, and restricts
@@ -301,7 +326,7 @@ addition to the alias-complete evaluation artifact.
 
 ## Versioning and citation
 
-The current package version is the `0.1.0` research snapshot. Releases follow
+The current package version is the `0.2.0` research snapshot. Releases follow
 semantic versioning for the Python/API surface; changes that alter a paper
 protocol or artifact schema are also called out explicitly in
 [CHANGELOG.md](CHANGELOG.md). For citation metadata, use
@@ -313,7 +338,7 @@ protocol or artifact schema are also called out explicitly in
   title   = {ARIA: Score- and Memory-Conditioned Retrieval and Compression
              for Latent-Compression Retrieval-Augmented Generation},
   year    = {2026},
-  version = {0.1.0},
+  version = {0.2.0},
   url     = {https://github.com/han67890/ARIA},
   note    = {Research code and accompanying manuscript}
 }

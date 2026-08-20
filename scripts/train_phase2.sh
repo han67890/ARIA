@@ -12,7 +12,13 @@ BASE_MODEL_REVISION="${BASE_MODEL_REVISION:-}"
 DATASET="${PHASE2_DATASET:-${ROOT_DIR}/data/aria/phase2}"
 NUM_GPUS="${NUM_GPUS:-8}"
 RAG_CONFIGURATION="${RAG_CONFIGURATION:-full}"
-OUTPUT_DIR="${PHASE2_OUTPUT_DIR:-${ROOT_DIR}/checkpoints/aria_phase2_${RAG_CONFIGURATION}_seed${SEED}_cr${CR}}"
+ACR_TRAINING_GATE="${ACR_TRAINING_GATE:-soft}"
+if [[ "${ACR_TRAINING_GATE}" == "soft" ]]; then
+  ACR_GATE_SUFFIX=""
+else
+  ACR_GATE_SUFFIX="_gate${ACR_TRAINING_GATE}"
+fi
+OUTPUT_DIR="${PHASE2_OUTPUT_DIR:-${ROOT_DIR}/checkpoints/aria_phase2_${RAG_CONFIGURATION}${ACR_GATE_SUFFIX}_seed${SEED}_cr${CR}}"
 
 CORPUS_PATH="${CORPUS_PATH:?set CORPUS_PATH to the de-duplicated fixed corpus}"
 TEST_URL_FILE="${TEST_URL_FILE:?set TEST_URL_FILE to official test page URLs}"
@@ -20,28 +26,14 @@ if [[ "${RAG_CONFIGURATION}" == "clara_baseline" ]]; then
   CORPUS_EMBEDDINGS_PATH="${CORPUS_EMBEDDINGS_PATH:-}"
   BGE_PROJECTION_PATH="${BGE_PROJECTION_PATH:-}"
   LAMBDA_MSE=0
-  LAMBDA_CFRS=0
-  LAMBDA_QR=0
-  LAMBDA_MTFRL=0
 else
   CORPUS_EMBEDDINGS_PATH="${CORPUS_EMBEDDINGS_PATH:?set CORPUS_EMBEDDINGS_PATH to aligned BGE vectors}"
   BGE_PROJECTION_PATH="${BGE_PROJECTION_PATH:?set BGE_PROJECTION_PATH to fitted W_BGE}"
   LAMBDA_MSE=0.1
-  LAMBDA_CFRS=0.1
-  LAMBDA_QR=0.05
-  LAMBDA_MTFRL=0.05
 fi
 
 case "${RAG_CONFIGURATION}" in
-  remove_cfrs)
-    LAMBDA_CFRS=0
-    ;;
-  static_second_retrieval)
-    LAMBDA_MTFRL=0
-    ;;
-  remove_all_coupling)
-    LAMBDA_CFRS=0
-    LAMBDA_MTFRL=0
+  remove_cfrs|static_second_retrieval|remove_all_coupling)
     ;;
   uniform_acr)
     ;;
@@ -98,9 +90,7 @@ torchrun --standalone --nproc_per_node="${NUM_GPUS}" -m openrlhf.cli.train_sft \
   --generation_top_k 5 \
   --stage2_retrieval_top_n 5 \
   --lambda_mse "${LAMBDA_MSE}" \
-  --lambda_cfrs "${LAMBDA_CFRS}" \
-  --lambda_qr "${LAMBDA_QR}" \
-  --lambda_mtfrl "${LAMBDA_MTFRL}" \
+  --acr_training_gate "${ACR_TRAINING_GATE}" \
   --rag_configuration "${RAG_CONFIGURATION}" \
   --max_epochs 5 \
   --learning_rate "${LR}" \

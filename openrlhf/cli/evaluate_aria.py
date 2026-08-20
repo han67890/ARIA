@@ -55,6 +55,12 @@ from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from tqdm import tqdm
 
 from openrlhf.models.modeling_aria import (
+    ARIA_LIKELIHOOD_REDUCTION,
+    ARIA_NO_COMPRESSION_CONFIGURATION,
+    ARIA_NO_COMPRESSION_CONTEXT_CEILING,
+    ARIA_NO_COMPRESSION_CONTEXT_POLICY,
+    ARIA_NO_COMPRESSION_MAX_NEW_TOKENS,
+    ARIA_NO_COMPRESSION_SCHEME,
     CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
     CLARA_ARCHIVE_PAGE_ID_SCHEME,
     CLARA_DOCUMENT_REPRESENTATION_SCHEME,
@@ -65,13 +71,14 @@ from openrlhf.models.modeling_aria import (
     COUPLING_CONTROL_PROTOCOL,
     CLaRa,
     CLaRaConfig,
+    CFRS_FIDELITY_SCHEME,
     MATCHED_EVIDENCE_TOKEN_BUDGET,
     MTFRL_INITIALIZATION_SCHEME,
-    CFRS_RECONSTRUCTION_SCHEME,
     ORACLE_TOP100_PROTOCOL,
     QR_INPUT_SCHEME,
     RAG_CONFIGURATION_SPECS,
     RAGPipelineConfig,
+    RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
     STATIC_SECOND_QUERY_SCHEME,
     UNIFORM_BUDGET_ALLOCATION_SCHEME,
     _BM25Index,
@@ -1132,12 +1139,25 @@ class ARIAEvaluator:
         bm25_index: Optional[_BM25Index] = None,
         retrieval_mode: str = "normal",
         corpus_page_ids: Optional[List[str]] = None,
+        no_compression: bool = False,
     ):
         if retrieval_mode not in {"normal", "oracle"}:
             raise ValueError("retrieval_mode must be 'normal' or 'oracle'")
+        if no_compression and retrieval_mode != "normal":
+            raise ValueError("ARIA-NoComp supports only Normal retrieval")
+        if no_compression and not use_rag_pipeline:
+            raise ValueError("ARIA-NoComp requires the full five-stage RAG pipeline")
+        if no_compression and corpus_ids is None:
+            raise ValueError("ARIA-NoComp requires stable corpus_ids for provenance")
         self.model = model
         self.use_rag_pipeline = use_rag_pipeline
         self.retrieval_mode = retrieval_mode
+        self.no_compression = bool(no_compression)
+        self.no_compression_context_limit = (
+            model._resolve_no_compression_context_limit()
+            if self.no_compression
+            else None
+        )
         self.corpus_ids = list(corpus_ids) if corpus_ids is not None else None
         self._has_explicit_page_ids = corpus_page_ids is not None
         self.corpus_page_ids = (
@@ -1217,6 +1237,18 @@ class ARIAEvaluator:
                 ccef_filter_threshold=0.30,
                 compression_rate=getattr(model, "compr_rate", None),
             )
+            if self.no_compression and (
+                not all(
+                    (cfg.use_qca, cfg.use_ahr, cfg.use_igfr, cfg.use_mads, cfg.use_ccef)
+                )
+                or cfg.use_cfrs
+                or cfg.acr_allocation_mode != "full"
+                or cfg.second_retrieval_mode != "disabled"
+            ):
+                raise ValueError(
+                    "ARIA-NoComp requires all five retrieval stages and no "
+                    "CFRS/ACR/MTFRL runtime path"
+                )
             if cfg.use_mtfrl:
                 mtfrl_projection = getattr(model, "_mtfrl_projection", None)
                 if mtfrl_projection is None:
@@ -1451,6 +1483,29 @@ class ARIAEvaluator:
             raise ValueError(
                 "Paper-protocol evaluation requires max_new_tokens=64"
             )
+        no_compression_protocol = (
+            {
+                "name": ARIA_NO_COMPRESSION_SCHEME,
+                "checkpoint_training_configuration": "full",
+                "retrieval_mode": "normal",
+                "retrieval_stages": ["QCA", "AHR", "IGFR", "MADS", "CCEF"],
+                "retrieval_rounds": 1,
+                "selected_document_ceiling": 5,
+                "document_order": "first-pass CCEF order",
+                "document_separator": "two-newlines",
+                "memory_compression": False,
+                "cfrs": False,
+                "acr": False,
+                "mtfrl": False,
+                "context_policy": ARIA_NO_COMPRESSION_CONTEXT_POLICY,
+                "protocol_context_ceiling": ARIA_NO_COMPRESSION_CONTEXT_CEILING,
+                "effective_context_ceiling": self.no_compression_context_limit,
+                "passage_truncation": False,
+                "decoding": "greedy-one-beam-eos-or-64",
+            }
+            if self.no_compression
+            else None
+        )
 
         all_metrics: List[Dict[str, float]] = []
         retrieval_cutoffs = (1, 3, 5) if self.retrieval_mode == "oracle" else (5,)
@@ -1458,6 +1513,8 @@ class ARIAEvaluator:
             cutoff: [] for cutoff in retrieval_cutoffs
         }
         evidence_memory_tokens: List[int] = []
+        direct_context_document_tokens: List[int] = []
+        direct_context_prompt_tokens: List[int] = []
         predictions: List[Dict[str, Any]] = []
 
         for start in tqdm(range(0, len(questions), batch_size), desc="Evaluating"):
@@ -1496,9 +1553,15 @@ class ARIAEvaluator:
                     # Appendix A.35 reports Normal Recall@5 on the first-pass
                     # CCEF survivors, before MTFRL changes the evidence set.
                     return_first_pass_indices=(
-                        gold_doc_ids is not None and self.retrieval_mode == "normal"
+                        self.no_compression
+                        or (
+                            gold_doc_ids is not None
+                            and self.retrieval_mode == "normal"
+                        )
                     ),
                 )
+                if self.no_compression:
+                    generation_kwargs["no_compression"] = True
                 if self.retrieval_mode == "oracle":
                     if (
                         self._corpus_id_to_index is None
@@ -1543,6 +1606,51 @@ class ARIAEvaluator:
 
             batch_retrieved_ids: Optional[List[List[str]]] = None
             batch_retrieved_page_ids: Optional[List[List[str]]] = None
+            batch_first_pass_corpus_indices: Optional[List[List[int]]] = None
+            if self.no_compression:
+                if not isinstance(retrieved_indices, torch.Tensor):
+                    raise RuntimeError(
+                        "ARIA-NoComp requires tensor-valued first-pass corpus indices"
+                    )
+                if (
+                    retrieved_indices.ndim != 2
+                    or retrieved_indices.shape
+                    != (len(batch_questions), self.model.generation_top_k)
+                    or retrieved_indices.dtype == torch.bool
+                    or torch.is_floating_point(retrieved_indices)
+                ):
+                    raise RuntimeError(
+                        "ARIA-NoComp first-pass indices must have integer shape "
+                        "(B, top_k)"
+                    )
+                if self.corpus_ids is None:
+                    raise RuntimeError("ARIA-NoComp stable corpus IDs are unavailable")
+                batch_first_pass_corpus_indices = []
+                for row_index, raw_row in enumerate(
+                    retrieved_indices.detach().cpu().tolist()
+                ):
+                    if -1 in raw_row:
+                        first_padding = raw_row.index(-1)
+                        if any(value != -1 for value in raw_row[first_padding:]):
+                            raise RuntimeError(
+                                "ARIA-NoComp padded first-pass indices must use "
+                                "trailing -1 values only"
+                            )
+                        raw_row = raw_row[:first_padding]
+                    index_row = [int(value) for value in raw_row]
+                    if (
+                        not 1 <= len(index_row) <= self.model.generation_top_k
+                        or len(index_row) != len(set(index_row))
+                        or any(
+                            value < 0 or value >= len(self.corpus_ids)
+                            for value in index_row
+                        )
+                    ):
+                        raise RuntimeError(
+                            "ARIA-NoComp returned invalid first-pass corpus indices "
+                            f"at batch row {row_index}"
+                        )
+                    batch_first_pass_corpus_indices.append(index_row)
             oracle_pool_records: Optional[List[Any]] = None
             if self.retrieval_mode == "oracle":
                 getter = getattr(self.model, "get_oracle_pool_records", None)
@@ -1710,28 +1818,68 @@ class ARIAEvaluator:
                     "gold_answers": golds,
                     **metrics,
                 }
+                if self.no_compression:
+                    if batch_first_pass_corpus_indices is None:
+                        raise RuntimeError(
+                            "ARIA-NoComp first-pass corpus provenance is unavailable"
+                        )
+                    prediction_record["first_pass_corpus_indices"] = (
+                        batch_first_pass_corpus_indices[offset]
+                    )
                 if batch_diagnostics is not None:
                     diagnostic = batch_diagnostics[offset]
-                    raw_token_count = getattr(
-                        diagnostic, "evidence_memory_tokens", None
-                    )
-                    if raw_token_count is not None:
-                        token_count = int(raw_token_count)
-                        if token_count <= 0:
+                    if self.no_compression:
+                        document_tokens = int(
+                            getattr(diagnostic, "direct_context_document_tokens", 0)
+                        )
+                        prompt_tokens = int(
+                            getattr(diagnostic, "direct_context_prompt_tokens", 0)
+                        )
+                        context_ceiling = int(
+                            getattr(diagnostic, "direct_context_ceiling", 0)
+                        )
+                        if (
+                            document_tokens <= 0
+                            or prompt_tokens <= 0
+                            or context_ceiling != self.no_compression_context_limit
+                            or prompt_tokens + max_new_tokens > context_ceiling
+                        ):
                             raise RuntimeError(
-                                "RAG diagnostics require a positive realized "
-                                "evidence-token count"
+                                "ARIA-NoComp diagnostics violate the direct-context "
+                                "no-truncation protocol"
                             )
-                        evidence_memory_tokens.append(token_count)
+                        direct_context_document_tokens.append(document_tokens)
+                        direct_context_prompt_tokens.append(prompt_tokens)
                         prediction_record["retrieval_diagnostics"] = {
                             "final_document_count": int(
                                 getattr(diagnostic, "final_candidates", 0)
                             ),
-                            "second_round_candidate_count": int(
-                                getattr(diagnostic, "second_round_candidates", 0)
-                            ),
-                            "evidence_memory_tokens": token_count,
+                            "second_round_candidate_count": 0,
+                            "direct_context_document_tokens": document_tokens,
+                            "direct_context_prompt_tokens": prompt_tokens,
+                            "direct_context_ceiling": context_ceiling,
                         }
+                    else:
+                        raw_token_count = getattr(
+                            diagnostic, "evidence_memory_tokens", None
+                        )
+                        if raw_token_count is not None:
+                            token_count = int(raw_token_count)
+                            if token_count <= 0:
+                                raise RuntimeError(
+                                    "RAG diagnostics require a positive realized "
+                                    "evidence-token count"
+                                )
+                            evidence_memory_tokens.append(token_count)
+                            prediction_record["retrieval_diagnostics"] = {
+                                "final_document_count": int(
+                                    getattr(diagnostic, "final_candidates", 0)
+                                ),
+                                "second_round_candidate_count": int(
+                                    getattr(diagnostic, "second_round_candidates", 0)
+                                ),
+                                "evidence_memory_tokens": token_count,
+                            }
                 if gold_doc_ids is not None:
                     if (
                         batch_retrieved_ids is None
@@ -1860,6 +2008,8 @@ class ARIAEvaluator:
                 empty_result["clara_retrieval_provenance"] = (
                     clara_retrieval_provenance
                 )
+            if no_compression_protocol is not None:
+                empty_result["no_compression_protocol"] = no_compression_protocol
             return empty_result
         result = {
             metric: float(np.mean([row[metric] for row in all_metrics]))
@@ -1873,6 +2023,22 @@ class ARIAEvaluator:
             result["mean_evidence_memory_tokens"] = float(
                 np.mean(evidence_memory_tokens)
             )
+        if self.no_compression:
+            if not (
+                len(direct_context_document_tokens)
+                == len(direct_context_prompt_tokens)
+                == len(all_metrics)
+            ):
+                raise RuntimeError(
+                    "ARIA-NoComp context diagnostics must cover every example"
+                )
+            result["mean_direct_context_document_tokens"] = float(
+                np.mean(direct_context_document_tokens)
+            )
+            result["mean_direct_context_prompt_tokens"] = float(
+                np.mean(direct_context_prompt_tokens)
+            )
+            result["no_compression_protocol"] = no_compression_protocol
         if gold_doc_ids is not None or clara_recall_enabled:
             support_page_rows = (
                 gold_page_ids if gold_doc_ids is not None else clara_gold_page_ids
@@ -1951,6 +2117,18 @@ def aggregate_checkpoint_results(
         )
     if all(evidence_presence):
         metric_names.append("mean_evidence_memory_tokens")
+    for context_metric in (
+        "mean_direct_context_document_tokens",
+        "mean_direct_context_prompt_tokens",
+    ):
+        context_presence = [context_metric in result for result in results]
+        if any(context_presence) and not all(context_presence):
+            raise ValueError(
+                f"{context_metric} must be present for every checkpoint result "
+                "or omitted from all"
+            )
+        if all(context_presence):
+            metric_names.append(context_metric)
     for recall_metric in ("recall_at_1", "recall_at_3", "recall_at_5"):
         recall_presence = [recall_metric in result for result in results]
         if any(recall_presence) and not all(recall_presence):
@@ -1988,6 +2166,18 @@ def aggregate_checkpoint_results(
                 "All matched CLaRa checkpoints must share exact evaluation-candidate provenance"
             )
         aggregated["clara_retrieval_provenance"] = clara_provenance[0]
+    no_compression_protocols = [
+        result.get("no_compression_protocol") for result in results
+    ]
+    if any(value is not None for value in no_compression_protocols):
+        if any(value is None for value in no_compression_protocols) or any(
+            value != no_compression_protocols[0]
+            for value in no_compression_protocols[1:]
+        ):
+            raise ValueError(
+                "All ARIA-NoComp checkpoints must share exact direct-context provenance"
+            )
+        aggregated["no_compression_protocol"] = no_compression_protocols[0]
     return aggregated
 
 
@@ -2460,6 +2650,24 @@ def _required_checkpoint_configuration(runtime_configuration: str) -> str:
     return required_checkpoint_configuration(runtime_configuration)
 
 
+def _create_evaluation_rag_config(
+    runtime_configuration: str,
+    compression_rate: int,
+    **overrides: Any,
+) -> RAGPipelineConfig:
+    """Build retrieval state for an evaluation-only runtime protocol."""
+    configuration = (
+        "forward_path_off"
+        if runtime_configuration == ARIA_NO_COMPRESSION_CONFIGURATION
+        else runtime_configuration
+    )
+    return create_paper_rag_config(
+        configuration,
+        compression_rate,
+        **overrides,
+    )
+
+
 def _assert_normal_retrieval_is_not_training_index(
     checkpoint_config: CLaRaConfig,
     *,
@@ -2624,8 +2832,9 @@ def _validate_checkpoint_protocol(
         "aria_text_sha256_scheme": TEXT_SHA256_SCHEME,
         "qr_input_scheme": QR_INPUT_SCHEME,
         "mtfrl_initialization_scheme": MTFRL_INITIALIZATION_SCHEME,
-        "cfrs_reconstruction_scheme": CFRS_RECONSTRUCTION_SCHEME,
-        "cfrs_reconstruction_chunk_tokens": 128,
+        "cfrs_fidelity_scheme": CFRS_FIDELITY_SCHEME,
+        "retrieval_straight_through_scheme": RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
+        "aria_likelihood_reduction": ARIA_LIKELIHOOD_REDUCTION,
     }
     for key, expected in canonical_architecture.items():
         if getattr(config, key, None) != expected:
@@ -2633,6 +2842,21 @@ def _validate_checkpoint_protocol(
                 f"Checkpoint architecture {key!r} must be {expected!r}, "
                 f"got {getattr(config, key, None)!r}"
             )
+    acr_training_gate = getattr(config, "aria_acr_training_gate", None)
+    if acr_training_gate not in {"soft", "hard_st"}:
+        raise ValueError(
+            "Checkpoint must record aria_acr_training_gate as 'soft' or 'hard_st'"
+        )
+    if getattr(config, "acr_training_gate", acr_training_gate) != acr_training_gate:
+        raise ValueError("Checkpoint ACR training-gate metadata is inconsistent")
+    expected_loss_weights = {
+        "lambda_mse": 0.0 if checkpoint_configuration == "clara_baseline" else 0.10
+    }
+    if getattr(config, "aria_loss_weights", None) != expected_loss_weights:
+        raise ValueError(
+            "Checkpoint Phase-II objective metadata must be "
+            f"{expected_loss_weights!r}"
+        )
     expected_lora_targets: Any = (
         "all-linear" if checkpoint_configuration == "clara_baseline" else ["q_proj"]
     )
@@ -2667,12 +2891,6 @@ def _validate_checkpoint_protocol(
             "clara_selection_count": 5,
             "clara_archive_document_id_scheme": CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
             "clara_archive_page_id_scheme": CLARA_ARCHIVE_PAGE_ID_SCHEME,
-            "aria_loss_weights": {
-                "lambda_mse": 0.0,
-                "lambda_cfrs": 0.0,
-                "lambda_qr": 0.0,
-                "lambda_mtfrl": 0.0,
-            },
         }
         for key, expected in expected_clara_metadata.items():
             if getattr(config, key, None) != expected:
@@ -2917,6 +3135,7 @@ def _validate_checkpoint_protocol(
             getattr(config, "compr_linear_type", None),
             bool(getattr(config, "compr_rms_norm", False)),
             getattr(config, "training_form", None),
+            acr_training_gate,
             compression_rate,
             phase1_manifest,
             phase1_test_digest,
@@ -3137,12 +3356,16 @@ def main() -> None:
     parser.add_argument("--no_rag_pipeline", action="store_true")
     parser.add_argument(
         "--rag_configuration",
-        choices=sorted(RAG_CONFIGURATION_SPECS),
+        choices=sorted(
+            set(RAG_CONFIGURATION_SPECS) | {ARIA_NO_COMPRESSION_CONFIGURATION}
+        ),
         default=None,
         help=(
             "Explicit training/runtime protocol. Use remove_all_coupling for "
             "the independently retrained 108-token/static-D2 control and "
-            "forward_path_off for the full-checkpoint 184-token/no-D2 intervention."
+            "forward_path_off for the full-checkpoint 184-token/no-D2 intervention. "
+            "no_compression is the evaluator-only ARIA-NoComp diagnostic: it "
+            "requires a full Phase-II checkpoint and Normal retrieval."
         ),
     )
     parser.add_argument("--no_cfrs", action="store_true")
@@ -3186,6 +3409,11 @@ def main() -> None:
             "Select an explicit --rag_configuration, or one supported legacy "
             "fixed-checkpoint switch combination"
         )
+    is_no_compression = (
+        expected_configuration == ARIA_NO_COMPRESSION_CONFIGURATION
+    )
+    if is_no_compression and args.retrieval_mode != "normal":
+        parser.error("--rag_configuration no_compression requires Normal retrieval")
     is_clara_baseline = expected_configuration == "clara_baseline"
     if is_clara_baseline:
         if args.clara_archive_dir is None:
@@ -3204,7 +3432,32 @@ def main() -> None:
         )
 
     seed_checkpoints = _resolve_seed_checkpoints(parser, args)
-    first_checkpoint_config = CLaRaConfig.from_pretrained(seed_checkpoints[0][1])
+    checkpoint_configs = [
+        CLaRaConfig.from_pretrained(checkpoint_path)
+        for _, checkpoint_path in seed_checkpoints
+    ]
+    first_checkpoint_config = checkpoint_configs[0]
+    checkpoint_acr_training_gates = [
+        getattr(config, "aria_acr_training_gate", None)
+        for config in checkpoint_configs
+    ]
+    if any(
+        gate not in {"soft", "hard_st"}
+        for gate in checkpoint_acr_training_gates
+    ):
+        parser.error(
+            "every checkpoint must record aria_acr_training_gate as "
+            "'soft' or 'hard_st'"
+        )
+    if len(set(checkpoint_acr_training_gates)) != 1:
+        parser.error("all reported checkpoints must use the same ACR training gate")
+    first_acr_training_gate = checkpoint_acr_training_gates[0]
+    if any(
+        getattr(config, "acr_training_gate", first_acr_training_gate)
+        != first_acr_training_gate
+        for config in checkpoint_configs
+    ):
+        parser.error("checkpoint ACR training-gate metadata is inconsistent")
     training_index_sha256 = getattr(
         first_checkpoint_config, "aria_training_retrieval_index_sha256", None
     )
@@ -3316,8 +3569,10 @@ def main() -> None:
             # checkpoints for this benchmark can safely share one full index.
             bm25_index = _BM25Index().build(corpus_docs)
 
-        rag_config = create_paper_rag_config(
-            expected_configuration, args.compression_rate
+        rag_config = _create_evaluation_rag_config(
+            expected_configuration,
+            args.compression_rate,
+            acr_training_gate=first_acr_training_gate,
         )
 
         checkpoint_results: List[Dict[str, Any]] = []
@@ -3390,6 +3645,7 @@ def main() -> None:
                 rag_config=rag_config,
                 bm25_index=bm25_index,
                 retrieval_mode=args.retrieval_mode,
+                no_compression=is_no_compression,
             )
 
             start_time = time.time()
@@ -3453,8 +3709,17 @@ def main() -> None:
             )
 
     result_prefix = "aria" if expected_configuration == "full" else expected_configuration
+    gate_suffix = (
+        "" if first_acr_training_gate == "soft" else f"_gate{first_acr_training_gate}"
+    )
+    compression_label = (
+        f"cr1_sourcecr{args.compression_rate}"
+        if is_no_compression
+        else f"cr{args.compression_rate}"
+    )
     output_path = os.path.join(
-        args.output_dir, f"{result_prefix}_{args.dataset}_cr{args.compression_rate}.json"
+        args.output_dir,
+        f"{result_prefix}_{args.dataset}_{compression_label}{gate_suffix}.json",
     )
     significance = None
     if args.baseline_results is not None:
@@ -3474,7 +3739,9 @@ def main() -> None:
         "metadata": {
             "dataset": args.dataset,
             "retrieval_mode": args.retrieval_mode,
-            "compression_rate": args.compression_rate,
+            "compression_rate": 1 if is_no_compression else args.compression_rate,
+            "source_checkpoint_compression_rate": args.compression_rate,
+            "acr_training_gate": first_acr_training_gate,
             "training_seeds": [seed for seed, _ in seed_checkpoints],
             "checkpoints": [path for _, path in seed_checkpoints],
             "inference_seed": args.inference_seed,
@@ -3505,6 +3772,18 @@ def main() -> None:
             "release_convention_inferred": (
                 rag_config.acr_allocation_mode == "uniform_budget"
                 or rag_config.second_retrieval_mode == "static_query"
+            ),
+            "no_compression_protocol": (
+                next(
+                    (
+                        result.get("no_compression_protocol")
+                        for name, result in all_results.items()
+                        if name != "avg"
+                    ),
+                    None,
+                )
+                if is_no_compression
+                else None
             ),
             "evaluation_retrieval_provenance": evaluation_retrieval_provenance,
             "clara_archive_sha256": (

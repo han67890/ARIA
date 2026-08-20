@@ -2,10 +2,16 @@
   "source": "ARIA Appendix Tables A51-A52",
   "entity_types": ["PERSON", "ORG", "GPE", "LOC", "FAC", "EVENT", "PRODUCT", "WORK_OF_ART"],
   "classification": {
-    "multi_hop": "any hop indicator",
-    "multi_aspect": "any aspect indicator and no assigned hop indicator",
+    "multi_hop": "explicit H02-H05, otherwise any remaining hop indicator after explicit aspect checks",
+    "multi_aspect": "explicit A01-A06 when no explicit hop fires, otherwise any remaining aspect indicator after hop checks",
     "simple": "otherwise",
-    "conflict_precedence": ["multi_hop", "multi_aspect", "simple"]
+    "conflict_precedence": [
+      "explicit_hop:H02-H05",
+      "explicit_aspect:A01-A06",
+      "remaining_hop",
+      "remaining_aspect",
+      "simple"
+    ]
   },
   "rules": [
     {"id": "H01", "category": "multi_hop", "weight": 1.0, "condition": "entity_count >= 3"},

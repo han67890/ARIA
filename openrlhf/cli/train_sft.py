@@ -37,6 +37,7 @@ from openrlhf.datasets.utils import blending_datasets
 from openrlhf.trainer.sft_trainer import SFTTrainer
 from openrlhf.utils import get_strategy, get_tokenizer
 from openrlhf.models.modeling_aria import (
+    ARIA_LIKELIHOOD_REDUCTION,
     CLARA_DOCUMENT_REPRESENTATION_SCHEME,
     CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
     CLARA_ARCHIVE_PAGE_ID_SCHEME,
@@ -84,12 +85,7 @@ _PAPER_PHASE_LENGTHS = {
     "stage1": {"input": 2_048, "target": 512},
     "stage2": {"input": 1_024, "target": 128},
 }
-_PAPER_PHASE2_LOSS_WEIGHTS = {
-    "lambda_mse": 0.10,
-    "lambda_cfrs": 0.10,
-    "lambda_qr": 0.05,
-    "lambda_mtfrl": 0.05,
-}
+_PAPER_PHASE2_LOSS_WEIGHTS = {"lambda_mse": 0.10}
 _PHASE1_SOURCE_COUNTS = {
     "simpleqa": 2_000_000,
     "complexqa": 2_000_000,
@@ -719,10 +715,12 @@ def setup_phase2_artifacts(args: argparse.Namespace, model: CLaRa) -> None:
         args.rag_configuration,
         args.compress_rate,
         top_k=args.generation_top_k,
+        acr_training_gate=args.acr_training_gate,
     )
     model.config.aria_rag_configuration = args.rag_configuration
     model.config.aria_coupling_control_protocol = COUPLING_CONTROL_PROTOCOL
     model.config.aria_acr_allocation_mode = rag_config.acr_allocation_mode
+    model.config.aria_acr_training_gate = rag_config.acr_training_gate
     model.config.aria_second_retrieval_mode = rag_config.second_retrieval_mode
     model.config.aria_uniform_evidence_token_budget = (
         MATCHED_EVIDENCE_TOKEN_BUDGET
@@ -933,6 +931,7 @@ def create_clara_config(args: argparse.Namespace) -> CLaRaConfig:
         sep=True,
         attn_implementation="flash_attention_2" if args.flash_attn else "sdpa",
         stage2_retrieval_top_n=args.stage2_retrieval_top_n,
+        acr_training_gate=args.acr_training_gate,
         pure_inference=args.pure_inference
     )
 
@@ -965,6 +964,7 @@ def setup_model(args: argparse.Namespace) -> CLaRa:
                 ),
                 "aria_phase1_training_seed": int(args.seed),
                 "aria_phase1_test_url_sha256": current_test_digest,
+                "aria_likelihood_reduction": ARIA_LIKELIHOOD_REDUCTION,
             }
             for key, expected in expected_phase1.items():
                 actual = getattr(phase1_config, key, None)
@@ -1008,6 +1008,7 @@ def setup_model(args: argparse.Namespace) -> CLaRa:
             generation_top_k=args.generation_top_k,
             doc_max_length=args.doc_max_length,
             compr_rate=args.compress_rate,
+            acr_training_gate=args.acr_training_gate,
             aria_rag_configuration=args.rag_configuration,
             lora_target_modules=(
                 "all-linear"
@@ -1033,8 +1034,10 @@ def setup_model(args: argparse.Namespace) -> CLaRa:
     model.config.aria_input_max_length = int(args.max_len)
     model.config.aria_target_max_length = int(args.target_max_length)
     model.config.aria_loss_weights = {
-        name: float(getattr(args, name)) for name in _PAPER_PHASE2_LOSS_WEIGHTS
+        name: (float(getattr(args, name)) if args.stage == "stage2" else 0.0)
+        for name in _PAPER_PHASE2_LOSS_WEIGHTS
     }
+    model.config.aria_likelihood_reduction = ARIA_LIKELIHOOD_REDUCTION
     if args.stage == "stage2" and args.rag_configuration == "clara_baseline":
         model.configure_clara_phase2_trainable_parameters()
     if not args.fit_bge_projection_only:
@@ -1841,22 +1844,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
     clara_group.add_argument("--lambda_mse", type=float, default=0.1,
                             help="Phase-II MSE coefficient lambda (paper: 0.10)")
     clara_group.add_argument(
-        "--lambda_cfrs",
-        type=float,
-        default=0.1,
-        help="Phase-II CFRS coefficient mu (paper: 0.10)",
-    )
-    clara_group.add_argument(
-        "--lambda_qr",
-        type=float,
-        default=0.05,
-        help="Phase-II QR alignment coefficient nu (paper: 0.05)",
-    )
-    clara_group.add_argument(
-        "--lambda_mtfrl",
-        type=float,
-        default=0.05,
-        help="Phase-II MTFRL coefficient xi (paper: 0.05)",
+        "--acr_training_gate",
+        choices=("soft", "hard_st"),
+        default="soft",
+        help=(
+            "ACR gate used during training: soft for the main model, hard_st "
+            "for the independently trained hard-gate analysis"
+        ),
     )
     clara_group.add_argument(
         "--rag_configuration",
@@ -2043,23 +2037,8 @@ def validate_arguments(args: argparse.Namespace):
             else (1.6e-4 if is_qwen else 2e-4)
         )
     if args.stage == "stage2" and args.rag_configuration == "clara_baseline":
-        # Appendix A.37 uses answer CE only.  Keep the shared trainer interface,
-        # but make every auxiliary coefficient exactly zero in the effective
-        # run configuration and serialized checkpoint.
-        for name in _PAPER_PHASE2_LOSS_WEIGHTS:
-            setattr(args, name, 0.0)
-    elif args.stage == "stage2":
-        # Disabled training operations have exactly zero coefficients in the
-        # serialized effective objective, while the remaining Eq. (13) terms
-        # retain their paper weights.
-        if args.rag_configuration in {"remove_cfrs", "remove_all_coupling"}:
-            args.lambda_cfrs = 0.0
-        if args.rag_configuration in {
-            "static_second_retrieval",
-            "remove_all_coupling",
-            "remove_mtfrl",
-        }:
-            args.lambda_mtfrl = 0.0
+        # The matched CLaRa control uses answer CE only.
+        args.lambda_mse = 0.0
 
     if args.stage == "stage2" and args.rag_configuration in FIXED_CHECKPOINT_CONFIGURATIONS:
         raise ValueError(
@@ -2207,16 +2186,7 @@ def validate_arguments(args: argparse.Namespace):
             raise ValueError("Paper-protocol Phase II requires exactly 500 warmup steps")
         expected_loss_weights = dict(_PAPER_PHASE2_LOSS_WEIGHTS)
         if args.rag_configuration == "clara_baseline":
-            expected_loss_weights = {
-                name: 0.0 for name in _PAPER_PHASE2_LOSS_WEIGHTS
-            }
-        else:
-            if args.rag_configuration in {"remove_cfrs", "remove_all_coupling"}:
-                expected_loss_weights["lambda_cfrs"] = 0.0
-            if args.rag_configuration in {
-                "static_second_retrieval", "remove_all_coupling"
-            }:
-                expected_loss_weights["lambda_mtfrl"] = 0.0
+            expected_loss_weights = {"lambda_mse": 0.0}
         for name, expected in expected_loss_weights.items():
             if not math.isclose(
                 getattr(args, name), expected, rel_tol=0.0, abs_tol=1e-12

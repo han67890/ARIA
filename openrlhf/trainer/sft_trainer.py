@@ -29,12 +29,7 @@ from openrlhf.utils.distributed_sampler import DistributedSampler
 
 # Set torch print options for better debugging
 
-_ARIA_AUXILIARY_LOSSES = {
-    "mse_loss": "lambda_mse",
-    "cfrs_loss": "lambda_cfrs",
-    "qr_loss": "lambda_qr",
-    "mtfrl_loss": "lambda_mtfrl",
-}
+_ARIA_AUXILIARY_LOSSES = {"mse_loss": "lambda_mse"}
 
 
 def _scalar_loss_tensor(value: Any, reference: torch.Tensor, name: str) -> torch.Tensor:
@@ -50,16 +45,61 @@ def _scalar_loss_tensor(value: Any, reference: torch.Tensor, name: str) -> torch
     return result
 
 
+def normalize_likelihood_for_global_token_mean(
+    local_mean_loss: torch.Tensor,
+    outputs: Dict[str, Any],
+    strategy: Any,
+) -> torch.Tensor:
+    """Convert a rank-local causal-LM mean to the global-minibatch mean."""
+    if "target_token_count" not in outputs:
+        raise KeyError("paper likelihood paths require target_token_count")
+    target_count = outputs["target_token_count"]
+    if not isinstance(target_count, torch.Tensor):
+        raise TypeError("target_token_count must be a scalar integer tensor")
+    return strategy.scale_loss_to_global_token_mean(local_mean_loss, target_count)
+
+
+def accumulate_aria_eval_loss_metrics(
+    eval_metrics: Dict[str, float],
+    loss_terms: Dict[str, torch.Tensor],
+    outputs: Dict[str, Any],
+    batch_size: int,
+) -> None:
+    """Accumulate QA by target token and MSE by example for exact eval means."""
+    target_count = outputs.get("target_token_count")
+    if not isinstance(target_count, torch.Tensor) or target_count.numel() != 1:
+        raise TypeError("target_token_count must be a scalar integer tensor")
+    if target_count.dtype == torch.bool or torch.is_floating_point(target_count):
+        raise TypeError("target_token_count must be a scalar integer tensor")
+    target_count_value = int(target_count.detach().item())
+    if target_count_value <= 0:
+        raise ValueError("target_token_count must be positive")
+    if batch_size <= 0:
+        raise ValueError("evaluation batch_size must be positive")
+
+    # QA is a token mean, while Eq. 4 is an example mean. Keeping separate
+    # numerators prevents a rank-scaled QA mean from being reweighted by the
+    # local number of examples during evaluation aggregation.
+    eval_metrics["qa_loss_sum"] += (
+        loss_terms["qa_loss"].detach().item() * target_count_value
+    )
+    eval_metrics["target_tokens"] += target_count_value
+    for name in ("mse_loss", "weighted_mse_loss"):
+        eval_metrics[f"{name}_sum"] += (
+            loss_terms[name].detach().item() * batch_size
+        )
+    eval_metrics["samples"] += batch_size
+
+
 def compose_aria_training_loss(
     qa_loss: torch.Tensor,
     outputs: Dict[str, Any],
     args: Any,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Compose Eq. (3) and expose every raw/weighted term for logging.
+    """Compose the Phase-II objective ``L_QA + lambda_mse * L_MSE``.
 
-    The model returns *unweighted* scalar losses. Full ARIA fails closed when a
-    term is absent. Separately trained ablations and the matched CLaRa control
-    may omit disabled terms; those are represented by exact zero scalars.
+    The model returns the unweighted alignment MSE. Full ARIA fails closed if
+    it is absent; Stage I and the matched CLaRa control use QA loss alone.
     """
     qa_loss = _scalar_loss_tensor(qa_loss, qa_loss, "qa_loss")
     terms: Dict[str, torch.Tensor] = {"qa_loss": qa_loss}
@@ -386,29 +426,17 @@ class SFTTrainer(ABC):
             self.model.train()
 
             for batch in self.train_dataloader:
-                if self.args.stage == "stage2":
-                    base_occurrences = batch.get("sample_occurrence_ids")
-                    if not isinstance(base_occurrences, (list, tuple)):
-                        raise ValueError(
-                            "Phase-II batches require stable sample occurrence IDs"
-                        )
-                    # A dataset row is encountered once per scheduled epoch.
-                    # Add the replayable training position so repeated epochs
-                    # receive independent run-seeded support draws, while a
-                    # checkpoint resume reconstructs the exact same draw.
-                    batch = dict(batch)
-                    batch["sample_occurrence_ids"] = [
-                        f"{value}\0epoch={epoch}\0step={step}\0row={row_index}"
-                        for row_index, value in enumerate(base_occurrences)
-                    ]
                 # Forward pass
                 loss, outputs = self.model(
                     batch=batch,
                     stage2_mips=self.args.stage2_mips,
                     stage2_retrieval_top_n=self.args.stage2_retrieval_top_n
                 )
+                loss = normalize_likelihood_for_global_token_mean(
+                    loss, outputs, self.strategy
+                )
 
-                # Eq. (3): QA plus all four explicitly weighted Phase-II terms.
+                # Phase II: QA plus the hidden-state alignment term.
                 total_loss, loss_terms = compose_aria_training_loss(
                     loss, outputs, args
                 )
@@ -444,13 +472,7 @@ class SFTTrainer(ABC):
             "loss_sum": 0.0,
             "qa_loss_sum": 0.0,
             "mse_loss_sum": 0.0,
-            "cfrs_loss_sum": 0.0,
-            "qr_loss_sum": 0.0,
-            "mtfrl_loss_sum": 0.0,
             "weighted_mse_loss_sum": 0.0,
-            "weighted_cfrs_loss_sum": 0.0,
-            "weighted_qr_loss_sum": 0.0,
-            "weighted_mtfrl_loss_sum": 0.0,
             "retrieval_recall_1": 0.0,
             "retrieval_recall_3": 0.0,
             "retrieval_recall_5": 0.0,
@@ -501,17 +523,7 @@ class SFTTrainer(ABC):
                                 loss_terms: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Update accumulated training metrics."""
         training_metrics["loss_sum"] += loss_terms["total_loss"].detach().item()
-        for name in (
-            "qa_loss",
-            "mse_loss",
-            "cfrs_loss",
-            "qr_loss",
-            "mtfrl_loss",
-            "weighted_mse_loss",
-            "weighted_cfrs_loss",
-            "weighted_qr_loss",
-            "weighted_mtfrl_loss",
-        ):
+        for name in ("qa_loss", "mse_loss", "weighted_mse_loss"):
             training_metrics[f"{name}_sum"] += loss_terms[name].detach().item()
 
         for key in step_metrics:
@@ -533,17 +545,7 @@ class SFTTrainer(ABC):
             "total_loss": training_metrics["loss_sum"] / self.strategy.accumulated_gradient,
             "lr": self.scheduler.get_last_lr()[0],
         }
-        for name in (
-            "qa_loss",
-            "mse_loss",
-            "cfrs_loss",
-            "qr_loss",
-            "mtfrl_loss",
-            "weighted_mse_loss",
-            "weighted_cfrs_loss",
-            "weighted_qr_loss",
-            "weighted_mtfrl_loss",
-        ):
+        for name in ("qa_loss", "mse_loss", "weighted_mse_loss"):
             logs_dict[name] = (
                 training_metrics[f"{name}_sum"]
                 / self.strategy.accumulated_gradient
@@ -642,16 +644,10 @@ class SFTTrainer(ABC):
 
         # Initialize evaluation metrics
         eval_metrics = {
-            "loss_sum": 0.0,
             "qa_loss_sum": 0.0,
+            "target_tokens": 0,
             "mse_loss_sum": 0.0,
-            "cfrs_loss_sum": 0.0,
-            "qr_loss_sum": 0.0,
-            "mtfrl_loss_sum": 0.0,
             "weighted_mse_loss_sum": 0.0,
-            "weighted_cfrs_loss_sum": 0.0,
-            "weighted_qr_loss_sum": 0.0,
-            "weighted_mtfrl_loss_sum": 0.0,
             "samples": 0,
             "correct": 0,
             "retrieval_recall_1": 0.0,
@@ -677,24 +673,9 @@ class SFTTrainer(ABC):
 
                 # Basic metrics
                 batch_size = len(batch["answers"])
-                eval_metrics["loss_sum"] += (
-                    loss_terms["total_loss"].detach().item() * batch_size
+                accumulate_aria_eval_loss_metrics(
+                    eval_metrics, loss_terms, outputs, batch_size
                 )
-                for name in (
-                    "qa_loss",
-                    "mse_loss",
-                    "cfrs_loss",
-                    "qr_loss",
-                    "mtfrl_loss",
-                    "weighted_mse_loss",
-                    "weighted_cfrs_loss",
-                    "weighted_qr_loss",
-                    "weighted_mtfrl_loss",
-                ):
-                    eval_metrics[f"{name}_sum"] += (
-                        loss_terms[name].detach().item() * batch_size
-                    )
-                eval_metrics["samples"] += batch_size
 
                 # Retrieval metrics
                 if self.args.stage == "stage2" and "topk_doc_ids" in outputs:
@@ -779,21 +760,19 @@ class SFTTrainer(ABC):
 
         # Basic metrics
         if eval_metrics["samples"] > 0:
-            final_metrics["eval_loss"] = eval_metrics["loss_sum"] / eval_metrics["samples"]
-            for name in (
-                "qa_loss",
-                "mse_loss",
-                "cfrs_loss",
-                "qr_loss",
-                "mtfrl_loss",
-                "weighted_mse_loss",
-                "weighted_cfrs_loss",
-                "weighted_qr_loss",
-                "weighted_mtfrl_loss",
-            ):
+            if eval_metrics["target_tokens"] <= 0:
+                raise ValueError("evaluation requires at least one target token")
+            final_metrics["eval_qa_loss"] = (
+                eval_metrics["qa_loss_sum"] / eval_metrics["target_tokens"]
+            )
+            for name in ("mse_loss", "weighted_mse_loss"):
                 final_metrics[f"eval_{name}"] = (
                     eval_metrics[f"{name}_sum"] / eval_metrics["samples"]
                 )
+            final_metrics["eval_loss"] = (
+                final_metrics["eval_qa_loss"]
+                + final_metrics["eval_weighted_mse_loss"]
+            )
 
             if eval_gen:
                 final_metrics["eval_acc"] = eval_metrics["correct"] / eval_metrics["samples"]
