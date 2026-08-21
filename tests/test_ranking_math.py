@@ -22,8 +22,8 @@ from openrlhf.models.modeling_aria import (
     _CCEF,
     _EntityAgent,
     _RetrievedDoc,
-    _ScoredDoc,
     _SemanticAgent,
+    _ahr_get_weights,
     _chunked_inner_product_topk,
     _chunked_inner_product_topk_unique_pages,
     _construct_oracle_top100_indices,
@@ -109,7 +109,7 @@ def test_qca_h05_where_template_precedes_generic_where_splitter(monkeypatch):
     monkeypatch.setattr(modeling_aria, "_qca_get_spacy", lambda: nlp)
 
     result = QuestionComplexityAssessor().assess(
-        "Where was Ada Lovelace born?"
+        "Where was Ada Lovelace born before meeting Bob?"
     )
 
     assert result.question_type is QuestionType.MULTI_HOP
@@ -120,19 +120,28 @@ def test_qca_h05_where_template_precedes_generic_where_splitter(monkeypatch):
     ]
 
 
-def test_qca_explicit_aspect_phrase_overrides_count_only_hop_rule(monkeypatch):
+def test_submission_qca_hop_rule_wins_aspect_conflict_with_two_entities(monkeypatch):
     nlp = _FakeSpacyPipeline()
     monkeypatch.setattr(modeling_aria, "_qca_get_spacy", lambda: nlp)
 
-    # Three entities activate the count-only H01 condition, but the manuscript
-    # evaluates explicit A01--A06 phrases first and lets them determine the
-    # route when the two rule families conflict.
     result = QuestionComplexityAssessor().assess(
         "Compare Alice, Bob, and Carol."
     )
 
     assert "A01" in result.matched_rules
-    assert result.question_type is QuestionType.MULTI_ASPECT
+    assert any(rule.startswith("H") for rule in result.matched_rules)
+    assert result.question_type is QuestionType.MULTI_HOP
+
+
+def test_submission_qca_hop_match_requires_two_entities(monkeypatch):
+    nlp = _FakeSpacyPipeline()
+    monkeypatch.setattr(modeling_aria, "_qca_get_spacy", lambda: nlp)
+
+    result = QuestionComplexityAssessor().assess("Where was Ada Lovelace born?")
+
+    assert "H05" in result.matched_rules
+    assert result.entity_count == 1
+    assert result.question_type is not QuestionType.MULTI_HOP
 
 
 def test_qca_explicit_hop_phrase_overrides_explicit_aspect_phrase(monkeypatch):
@@ -145,6 +154,34 @@ def test_qca_explicit_hop_phrase_overrides_explicit_aspect_phrase(monkeypatch):
 
     assert {"H02", "A01"}.issubset(result.matched_rules)
     assert result.question_type is QuestionType.MULTI_HOP
+
+
+def test_release_convention_ahr_confidence_interpolates_balanced_to_type_endpoint():
+    low = QCAResult(
+        question="q",
+        question_type=QuestionType.MULTI_HOP,
+        confidence=0.0,
+        hop_count=2,
+        entity_count=2,
+    )
+    high = QCAResult(
+        question="q",
+        question_type=QuestionType.MULTI_HOP,
+        confidence=1.0,
+        hop_count=2,
+        entity_count=2,
+    )
+    middle = QCAResult(
+        question="q",
+        question_type=QuestionType.MULTI_HOP,
+        confidence=0.5,
+        hop_count=2,
+        entity_count=2,
+    )
+
+    assert _ahr_get_weights(low) == pytest.approx((0.5, 0.5))
+    assert _ahr_get_weights(high) == pytest.approx((0.25, 0.75))
+    assert _ahr_get_weights(middle) == pytest.approx((0.375, 0.625))
 
 
 def test_qca_who_action_phrase_uses_entity_count_disambiguation(monkeypatch):
@@ -245,28 +282,39 @@ def test_mads_minmax_tie_uses_paper_half_score_fallback():
     assert _CCEF._minmax([3.0, 3.0, 3.0]) == [0.5, 0.5, 0.5]
 
 
-def test_mtfrl_projection_uses_independent_xavier_weights_and_zero_biases():
-    torch.manual_seed(7)
+def test_submission_mtfrl_initialization_realizes_the_fitted_bge_map():
+    bge = torch.nn.Linear(12, 3, bias=False)
+    with torch.no_grad():
+        bge.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 2.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ]
+            )
+        )
     model = SimpleNamespace(
-        hidden_size=4,
-        _bge_projection=torch.nn.Linear(4, 3, bias=False),
+        hidden_size=12,
+        _bge_projection=bge,
         decoder=SimpleNamespace(device=torch.device("cpu")),
         config=SimpleNamespace(mtfrl_hidden_width=None),
     )
+
     CLaRa.setup_mtfrl_projection(model, initialize_from_bge=True)
-    assert model.config.mtfrl_initialization_scheme == (
-        "xavier-uniform-zero-bias-v1"
+
+    values = torch.tensor(
+        [
+            [0.5, -1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-2.0, 0.25, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
     )
-    assert model.config.mtfrl_initialization_rank is None
-    linear_layers = [
-        module
-        for module in model._mtfrl_projection.modules()
-        if isinstance(module, torch.nn.Linear)
-    ]
-    assert len(linear_layers) == 2
-    for layer in linear_layers:
-        assert torch.count_nonzero(layer.weight).item() > 0
-        assert torch.count_nonzero(layer.bias).item() == 0
+    assert torch.allclose(
+        model._mtfrl_projection(values),
+        bge(values),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def test_mtfrl_width_is_exactly_half_the_backbone_hidden_size():
@@ -274,7 +322,7 @@ def test_mtfrl_width_is_exactly_half_the_backbone_hidden_size():
     assert _mtfrl_hidden_width(3584, 1024) == 1792
 
 
-def test_mtfrl_normalizes_the_document_balanced_mean_before_projection():
+def test_submission_mtfrl_uses_five_hard_effective_prefixes():
     class _CaptureLinear(torch.nn.Linear):
         def forward(self, values):
             self.last_input = values.detach().clone()
@@ -288,251 +336,72 @@ def test_mtfrl_normalizes_the_document_balanced_mean_before_projection():
     model._mtfrl_projection = torch.nn.Sequential(projection)
     model._rag_config = SimpleNamespace(numerical_epsilon=1e-6)
     memory = torch.tensor(
-        [
-            [
-                [[3.0, 0.0], [99.0, 99.0]],
-                [[0.0, 1.0], [0.0, 1.0]],
-            ]
-        ]
+        [[
+            [[1.0, 0.0], [99.0, 99.0]],
+            [[0.0, 2.0], [0.0, 2.0]],
+            [[3.0, 0.0], [99.0, 99.0]],
+            [[0.0, 4.0], [0.0, 4.0]],
+            [[5.0, 0.0], [99.0, 99.0]],
+        ]]
     )
-    counts = torch.tensor([[1, 2]])
+    counts = torch.tensor([[1, 2, 1, 2, 1]])
 
     actual = model._compute_mtfrl_feedback_query(
         memory,
         effective_counts=counts,
-        document_mask=torch.tensor([[True, True]]),
     )
 
-    pooled = torch.tensor([[1.5, 0.5]])
-    normalized_input = torch.nn.functional.normalize(pooled, dim=-1)
-    projected = normalized_input @ projection.weight.detach().T
-    assert torch.allclose(projection.last_input, normalized_input)
+    expected_pool = torch.tensor(
+        [[(1 + 0 + 3 + 0 + 5) / 5, (0 + 2 + 0 + 4 + 0) / 5]]
+    )
+    expected_input = torch.nn.functional.normalize(expected_pool, dim=-1)
+    expected_output = expected_input @ projection.weight.detach().T
+    assert torch.allclose(projection.last_input, expected_input)
     assert torch.allclose(
         actual,
-        torch.nn.functional.normalize(projected, dim=-1),
+        torch.nn.functional.normalize(expected_output, dim=-1),
     )
 
 
-def test_first_pass_feedback_uses_soft_pooling_only_while_training():
+def test_release_convention_mtfrl_rejects_non_five_document_input():
     model = CLaRa.__new__(CLaRa)
     torch.nn.Module.__init__(model)
-    calls = []
+    model._mtfrl_projection = torch.nn.Identity()
+    model._rag_config = SimpleNamespace(numerical_epsilon=1e-6)
 
-    def capture(memory, effective_counts=None, gates=None, base_counts=None,
-                document_mask=None):
-        calls.append(
-            {
-                "memory": memory,
-                "effective_counts": effective_counts,
-                "gates": gates,
-                "base_counts": base_counts,
-                "document_mask": document_mask,
-            }
+    with pytest.raises(ValueError, match="five"):
+        model._compute_mtfrl_feedback_query(
+            torch.ones(1, 4, 2, 3),
+            effective_counts=torch.ones(1, 4, dtype=torch.long),
         )
-        return torch.tensor([[1.0, 0.0]])
-
-    model._compute_mtfrl_feedback_query = capture
-    first_pass = {
-        "memory": torch.randn(1, 2, 3, 4),
-        "gates": torch.rand(1, 2, 3),
-        "base_counts": torch.tensor([[3, 3]]),
-        "effective_counts": torch.tensor([[1, 2]]),
-        "document_mask": torch.tensor([[True, True]]),
-    }
-
-    model.train()
-    model._compute_first_pass_feedback_query(first_pass)
-    assert calls[-1]["gates"] is first_pass["gates"]
-    assert calls[-1]["base_counts"] is first_pass["base_counts"]
-    assert calls[-1]["effective_counts"] is None
-
-    model.eval()
-    model._compute_first_pass_feedback_query(first_pass)
-    assert calls[-1]["effective_counts"] is first_pass["effective_counts"]
-    assert calls[-1]["gates"] is None
-    assert calls[-1]["base_counts"] is None
 
 
-def test_cfrs_is_masked_hidden_mean_coordinate_mse():
-    memory_hidden = torch.tensor(
+def test_submission_cfrs_matches_teacher_forced_squared_probability_error():
+    logits = torch.tensor(
         [
-            [[1.0, 3.0], [3.0, 5.0], [100.0, 100.0]],
-            [[-1.0, 1.0], [100.0, 100.0], [3.0, 5.0]],
+            [[2.0, 0.0, -1.0], [0.1, 0.2, 0.3], [1.0, -1.0, 0.0]],
+            [[-0.5, 0.5, 1.5], [3.0, 0.0, -2.0], [0.0, 0.0, 0.0]],
         ],
         requires_grad=True,
     )
-    memory_mask = torch.tensor(
-        [[True, True, False], [True, False, True]]
-    )
-    non_memory_hidden = torch.tensor(
-        [
-            [[0.0, 0.0], [2.0, 2.0], [100.0, 100.0], [100.0, 100.0]],
-            [[0.0, 1.0], [2.0, 1.0], [100.0, 100.0], [100.0, 100.0]],
-        ],
-        requires_grad=True,
-    )
-    non_memory_mask = torch.tensor(
-        [[True, True, False, False], [True, True, False, False]]
-    )
+    target_ids = torch.tensor([[0, 2, 1], [2, 0, 1]])
+    target_mask = torch.tensor([[True, True, False], [True, False, True]])
 
-    actual = CompressionFidelityReranker.hidden_mean_coordinate_mse(
-        memory_hidden,
-        memory_mask,
-        non_memory_hidden,
-        non_memory_mask,
+    actual = CompressionFidelityReranker.squared_probability_error(
+        logits, target_ids, target_mask
     )
-    expected = torch.tensor([5.0, 2.0])
+    probabilities = logits.softmax(dim=-1)
+    targets = torch.nn.functional.one_hot(
+        target_ids, num_classes=logits.size(-1)
+    ).to(probabilities)
+    per_token = (probabilities - targets).square().sum(dim=-1)
+    expected = torch.stack(
+        [per_token[0, :2].mean(), per_token[1, [0, 2]].mean()]
+    )
 
     assert torch.allclose(actual, expected, atol=1e-7, rtol=0)
     actual.sum().backward()
-    assert memory_hidden.grad is not None
-    assert non_memory_hidden.grad is not None
-    assert memory_hidden.grad[memory_mask].abs().sum() > 0
-    assert non_memory_hidden.grad[non_memory_mask].abs().sum() > 0
-    assert torch.count_nonzero(memory_hidden.grad[~memory_mask]) == 0
-    assert torch.count_nonzero(non_memory_hidden.grad[~non_memory_mask]) == 0
-
-
-def test_cfrs_soft_gate_mean_is_normalized_by_valid_gate_mass():
-    memory_hidden = torch.tensor(
-        [[[2.0, 0.0], [0.0, 4.0], [100.0, 100.0]]],
-        requires_grad=True,
-    )
-    memory_mask = torch.tensor([[True, True, False]])
-    memory_weights = torch.tensor(
-        [[1.0, 0.25, 1_000_000.0]],
-        requires_grad=True,
-    )
-    non_memory_hidden = torch.zeros(1, 1, 2, requires_grad=True)
-    non_memory_mask = torch.tensor([[True]])
-
-    actual = CompressionFidelityReranker.hidden_mean_coordinate_mse(
-        memory_hidden,
-        memory_mask,
-        non_memory_hidden,
-        non_memory_mask,
-        memory_weights=memory_weights,
-    )
-
-    # The valid weighted mean is [1.6, 0.8], not the count-diluted [1.0, 0.5].
-    assert torch.allclose(actual, torch.tensor([1.6]), atol=1e-6, rtol=0)
-    assert not torch.allclose(actual, torch.tensor([0.625]))
-    actual.sum().backward()
-    assert memory_weights.grad is not None
-    assert memory_weights.grad[0, :2].abs().sum() > 0
-    assert memory_weights.grad[0, 2].item() == 0.0
-    assert torch.count_nonzero(memory_hidden.grad[0, 2]) == 0
-
-
-def test_cfrs_per_document_wrapper_preserves_flat_source_alignment():
-    model = CLaRa.__new__(CLaRa)
-    torch.nn.Module.__init__(model)
-    memory = torch.tensor(
-        [[
-            [[1.0, 3.0], [3.0, 5.0], [99.0, 99.0]],
-            [[3.0, 1.0], [99.0, 99.0], [99.0, 99.0]],
-        ]]
-    )
-    counts = torch.tensor([[2, 1]])
-    source_hidden = torch.tensor(
-        [
-            [[0.0, 0.0], [2.0, 2.0], [99.0, 99.0], [99.0, 99.0]],
-            [[99.0, 99.0], [1.0, 1.0], [99.0, 99.0], [3.0, 1.0]],
-        ]
-    )
-    source_mask = torch.tensor(
-        [[True, True, False, False], [False, True, False, True]]
-    )
-
-    actual = model._compute_cfrs_errors(
-        memory,
-        counts,
-        source_hidden,
-        source_mask,
-    )
-
-    assert actual.shape == (1, 2)
-    assert torch.allclose(actual, torch.tensor([[5.0, 0.5]]))
-
-
-def test_cfrs_per_document_wrapper_uses_soft_gate_mass_not_token_count():
-    model = CLaRa.__new__(CLaRa)
-    torch.nn.Module.__init__(model)
-    memory = torch.tensor(
-        [[[[2.0, 0.0], [0.0, 4.0], [100.0, 100.0]]]]
-    )
-    counts = torch.tensor([[2]])
-    weights = torch.tensor([[[1.0, 0.25, 1_000_000.0]]])
-    source_hidden = torch.tensor([[[0.0, 0.0], [99.0, 99.0]]])
-    source_mask = torch.tensor([[True, False]])
-
-    actual = model._compute_cfrs_errors(
-        memory,
-        counts,
-        source_hidden,
-        source_mask,
-        memory_weights=weights,
-    )
-
-    assert actual.shape == (1, 1)
-    assert torch.allclose(actual, torch.tensor([[1.6]]), atol=1e-6, rtol=0)
-
-
-def test_compressor_fidelity_context_excludes_special_and_padding_positions():
-    class _FixedHiddenDecoder(torch.nn.Module):
-        def __init__(self, hidden_states):
-            super().__init__()
-            self.register_buffer("fixed_hidden_states", hidden_states)
-
-        def set_adapter(self, adapter_name):
-            self.active_adapter = adapter_name
-
-        def forward(self, **_kwargs):
-            return SimpleNamespace(hidden_states=(self.fixed_hidden_states,))
-
-    hidden = torch.tensor(
-        [[
-            [50.0, 50.0],
-            [1.0, 2.0],
-            [3.0, 4.0],
-            [5.0, 6.0],
-            [100.0, 100.0],
-            [7.0, 8.0],
-        ]]
-    )
-    model = CLaRa.__new__(CLaRa)
-    torch.nn.Module.__init__(model)
-    model.compr = None
-    model.adapter_keys = {"encoder_adapter"}
-    model.n_mem_tokens = 2
-    model.decoder = _FixedHiddenDecoder(hidden)
-    model.decoder_tokenizer = SimpleNamespace(
-        mem_token_ids_pt=torch.tensor([90, 91]),
-        all_special_ids=[0, 1, 90, 91],
-    )
-    input_ids = torch.tensor([[1, 10, 90, 91, 0, 11]])
-    attention_mask = torch.tensor([[1, 1, 1, 1, 0, 1]])
-
-    (
-        compressed,
-        _mse,
-        _compatibility,
-        source_hidden,
-        source_non_memory_mask,
-        memory_counts,
-    ) = model._compress_with_fidelity(
-        input_ids,
-        attention_mask,
-        return_alignment_context=True,
-    )
-
-    assert torch.equal(
-        source_non_memory_mask,
-        torch.tensor([[False, True, False, False, False, True]]),
-    )
-    assert memory_counts.tolist() == [2]
-    assert torch.equal(compressed, hidden[:, 2:4])
-    assert not source_hidden.requires_grad
+    assert logits.grad is not None and logits.grad.abs().sum() > 0
 
 
 def test_oracle_top100_tail_injection_preserves_order_and_gold_annotation_order():
@@ -911,83 +780,110 @@ def test_igfr_entities_are_batched_and_lru_bounded(monkeypatch):
     assert list(pipeline._igfr_entity_cache) == ["b", "d"]
 
 
-def test_cfrs_ranking_is_point_three_reverse_minmax_and_detaches_error():
+def test_submission_cfrs_ranking_keeps_the_reconstruction_gradient_path():
     relevance = torch.tensor([[0.2, 0.8, 0.5]], requires_grad=True)
     error = torch.tensor([0.1, 0.9, 0.5], requires_grad=True)
     scores = CompressionFidelityReranker.rerank(relevance, error)
 
-    fidelity = torch.tensor([[1.0, 0.0, 0.5]])
+    epsilon = 1e-6
+    span = 0.8
+    fidelity = torch.tensor(
+        [[(0.9 - 0.1) / (span + epsilon), 0.0, (0.9 - 0.5) / (span + epsilon)]]
+    )
     assert torch.allclose(scores, 0.7 * relevance + 0.3 * fidelity)
-    scores.sum().backward()
-    assert error.grad is None
+    downstream_weights = torch.tensor([[1.0, 2.0, 4.0]])
+    (scores * downstream_weights).sum().backward()
+
+    # ARIA_old.tex Appendix A.1 detaches the normalization statistics, not
+    # g_i itself: every local derivative is -1 / Delta.
+    expected_gradient = -0.3 * downstream_weights.reshape(-1) / (span + epsilon)
+    assert torch.allclose(error.grad, expected_gradient)
 
 
-def test_cfrs_tied_errors_use_half_fidelity_and_preserve_score_ties():
+def test_submission_cfrs_tied_errors_follow_literal_epsilon_formula():
+    error = torch.tensor([2.0, 2.0, 2.0], requires_grad=True)
     scores = CompressionFidelityReranker.rerank(
         torch.tensor([[0.4, 0.4, 0.4]]),
-        torch.tensor([2.0, 2.0, 2.0]),
+        error,
     )
-    assert torch.equal(scores, torch.tensor([[0.43, 0.43, 0.43]]))
+    assert torch.equal(scores, torch.tensor([[0.28, 0.28, 0.28]]))
+    scores.sum().backward()
+    assert torch.allclose(error.grad, torch.full_like(error, -0.3 / 1e-6))
 
 
-def test_acr_literal_rates_and_hard_gate_threshold():
+def test_release_convention_cfrs_permutation_is_hard_forward_and_soft_backward():
+    model = CLaRa.__new__(CLaRa)
+    torch.nn.Module.__init__(model)
+    memory = torch.tensor([[[[1.0]], [[2.0]], [[4.0]], [[8.0]], [[16.0]]]])
+    scores = torch.tensor(
+        [[0.2, 0.9, 0.5, 0.1, 0.7]],
+        requires_grad=True,
+    )
+
+    ordered, hard_order = model._straight_through_cfrs_permutation(
+        memory,
+        scores,
+        torch.ones_like(scores, dtype=torch.bool),
+    )
+
+    assert hard_order.tolist() == [[1, 4, 2, 0, 3]]
+    assert torch.equal(
+        ordered.detach().reshape(-1),
+        torch.tensor([2.0, 16.0, 4.0, 1.0, 8.0]),
+    )
+    downstream_weights = torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0])
+    (ordered.reshape(-1) * downstream_weights).sum().backward()
+    assert scores.grad is not None
+    assert scores.grad.abs().sum() > 0
+
+
+def test_submission_acr_uses_literal_epsilon_normalization_and_soft_gate():
     allocator = AdaptiveCompressionAllocator(min_ratio=0.25, max_ratio=1.0)
     ratios = allocator.ratios_from_scores(torch.tensor([[0.0, 1.0]]))
     assert ratios[0, 0] == 0.25
-    assert ratios[0, 1] == 1.0
-    embeddings = torch.ones(2, 4, 3)
-    _, _, counts = allocator.apply_ratios(embeddings, ratios, torch.tensor([4, 4]))
-    assert counts.tolist() == [1, 4]
+    assert ratios[0, 1] == pytest.approx(0.25 + 0.75 / 1.000001)
+    embeddings = torch.ones(2, 4, 3, requires_grad=True)
+    gated, gates, counts = allocator.apply_ratios(
+        embeddings, ratios, torch.tensor([4, 4])
+    )
+    expected_positions = torch.arange(1, 5, dtype=torch.float32)
+    expected = torch.sigmoid(
+        10.0 * (ratios.squeeze(0).float().unsqueeze(1) * 4 - expected_positions)
+    )
+    assert torch.allclose(gates, expected)
+    assert torch.allclose(gated, embeddings * gates.unsqueeze(-1))
+    assert counts.tolist() == [1, 3]
+    gated.sum().backward()
+    assert embeddings.grad is not None and embeddings.grad.abs().sum() > 0
 
 
-def test_acr_singleton_and_multi_document_tie_follow_paper_cases():
+def test_release_convention_mtfrl_clamps_an_empty_effective_prefix_to_one():
+    allocator = AdaptiveCompressionAllocator(min_ratio=0.25, max_ratio=1.0)
+    embeddings = torch.ones(1, 2, 1, requires_grad=True)
+
+    gated, gates, counts = allocator.apply_ratios(
+        embeddings,
+        torch.tensor([0.25]),
+        base_token_counts=torch.tensor([1]),
+    )
+
+    # The paper's 1/T_i mean is undefined at zero. The release keeps one token
+    # for MTFRL auditing while the generator still receives the literal soft
+    # sigmoid state from Eq. (8).
+    assert counts.tolist() == [1]
+    assert torch.allclose(
+        gates,
+        torch.tensor([[torch.sigmoid(torch.tensor(-7.5)), 0.0]]),
+    )
+    assert torch.allclose(gated, embeddings * gates.unsqueeze(-1))
+
+
+def test_submission_acr_does_not_add_singleton_or_tie_special_cases():
     allocator = AdaptiveCompressionAllocator(min_ratio=0.25, max_ratio=1.0)
     singleton = allocator.ratios_from_scores(torch.tensor([[3.0]]))
     tied = allocator.ratios_from_scores(torch.tensor([[3.0, 3.0, 3.0]]))
-    assert singleton.tolist() == [[1.0]]
-    assert tied.tolist() == [[0.625, 0.625, 0.625]]
-
-
-def test_acr_hard_st_is_hard_forward_and_sigmoid_backward():
-    allocator = AdaptiveCompressionAllocator(
-        min_ratio=0.25,
-        max_ratio=1.0,
-        beta=10.0,
-    )
-    embeddings = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])
-    base_counts = torch.tensor([4])
-
-    soft_ratio = torch.tensor([0.62], requires_grad=True)
-    soft, _, _ = allocator.apply_ratios(
-        embeddings,
-        soft_ratio,
-        base_token_counts=base_counts,
-        training_gate_mode="soft",
-    )
-    soft_gradient = torch.autograd.grad(soft.sum(), soft_ratio)[0]
-
-    hard_ratio = torch.tensor([0.62], requires_grad=True)
-    hard_st, applied_gates, effective_counts = allocator.apply_ratios(
-        embeddings,
-        hard_ratio,
-        base_token_counts=base_counts,
-        training_gate_mode="hard_st",
-    )
-
-    # floor(0.62 * 4) == 2: the forward tensor is the exact inference tensor.
-    assert torch.equal(
-        hard_st.detach(),
-        torch.tensor([[[1.0], [2.0], [0.0], [0.0]]]),
-    )
-    assert torch.equal(
-        applied_gates.detach(),
-        torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
-    )
-    assert effective_counts.tolist() == [2]
-
-    hard_gradient = torch.autograd.grad(hard_st.sum(), hard_ratio)[0]
-    assert hard_gradient.abs().item() > 0
-    assert torch.allclose(hard_gradient, soft_gradient, atol=1e-7, rtol=0)
+    assert singleton.tolist() == [[0.25]]
+    assert tied.tolist() == [[0.25, 0.25, 0.25]]
 
 
 def test_chunked_dense_search_matches_full_matrix_topk():
@@ -1164,6 +1060,27 @@ def test_ccef_never_reinserts_documents_below_threshold():
     assert [doc.doc_id for doc in survivors] == ["0"]
 
 
+def test_submission_ccef_retains_exactly_the_top_five_survivors():
+    pipeline = RAGEnhancementPipeline(
+        qca=None,
+        ahr=SimpleNamespace(corpus_page_ids=[str(index) for index in range(6)]),
+        ccef=None,
+        config=RAGPipelineConfig(
+            use_mads=False,
+            use_ccef=True,
+            ccef_filter_threshold=0.0,
+        ),
+    )
+    retrieved = [
+        _RetrievedDoc(str(index), str(index), index, hybrid_score=float(6 - index))
+        for index in range(6)
+    ]
+
+    survivors = pipeline._mads_ccef("query", retrieved, top_k=5)
+
+    assert [document.doc_id for document in survivors] == ["0", "1", "2", "3", "4"]
+
+
 def test_cr4_clara_prompt_reserves_all_five_memory_blocks():
     max_length = _fixed_memory_prompt_max_length(5, 1024 // 4, 1024)
     assert max_length == 2560
@@ -1252,114 +1169,3 @@ def test_base_slot_pruning_preserves_acr_soft_gate_after_effective_floor():
     embeds[:, :4].sum().backward()
     assert raw_memory.grad is not None
     assert raw_memory.grad[0, 3].abs().sum() > 0
-
-
-def _selected_document_st_fixture():
-    model = CLaRa.__new__(CLaRa)
-    torch.nn.Module.__init__(model)
-    model._rag_config = RAGPipelineConfig(use_mads=False)
-    model.rag_pipeline = SimpleNamespace(
-        ahr=SimpleNamespace(
-            dense_embeddings=torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-        )
-    )
-    return model
-
-
-def test_selected_document_identity_st_is_exact_and_trains_qr_without_feedback():
-    model = _selected_document_st_fixture()
-    evidence = [[
-        _ScoredDoc(
-            doc_id="0",
-            text="first",
-            corpus_index=0,
-            fused_score=0.2,
-            from_second_round=False,
-        ),
-    ]]
-    memory = torch.tensor(
-        [[[[1.0, 2.0, 3.0], [0.5, 1.0, 1.5]]]],
-        requires_grad=True,
-    )
-    qr_output = torch.tensor([[0.6, 0.8]], requires_grad=True)
-
-    selected = model._apply_selected_doc_cosine_identity_st(
-        memory,
-        evidence,
-        qr_output,
-    )
-
-    # Retrieval stays a hard, identity-preserving forward operation: the
-    # reader receives exactly the selected memory, with no score rescaling.
-    assert torch.equal(selected.detach(), memory.detach())
-    selected.sum().backward()
-    assert qr_output.grad is not None and qr_output.grad.abs().sum() > 0
-
-
-def test_selected_document_identity_st_trains_qr_and_pfb_but_ignores_pad_slots():
-    model = _selected_document_st_fixture()
-    evidence = [[
-        _ScoredDoc(
-            doc_id="1",
-            text="second-round",
-            corpus_index=1,
-            fused_score=0.8,
-            from_second_round=True,
-        ),
-    ]]
-
-    def gradients(padding_value):
-        memory = torch.tensor(
-            [[
-                [[1.0, 2.0, 3.0], [0.5, 1.0, 1.5]],
-                [[padding_value] * 3, [padding_value] * 3],
-            ]]
-        )
-        qr_output = torch.tensor([[0.6, 0.8]], requires_grad=True)
-        pfb_output = torch.tensor([[0.8, 0.6]], requires_grad=True)
-        selected = model._apply_selected_doc_cosine_identity_st(
-            memory,
-            evidence,
-            qr_output,
-            pfb_output,
-        )
-        assert torch.equal(selected.detach(), memory)
-        loss = selected.sum()
-        return torch.autograd.grad(loss, (qr_output, pfb_output))
-
-    zero_pad_gradients = gradients(0.0)
-    huge_pad_gradients = gradients(1_000_000.0)
-
-    expected = (
-        torch.tensor([[-4.32, 3.24]]),
-        torch.tensor([[-4.32, 5.76]]),
-    )
-    for zero_pad, huge_pad, expected_gradient in zip(
-        zero_pad_gradients,
-        huge_pad_gradients,
-        expected,
-    ):
-        assert zero_pad.abs().sum() > 0
-        assert torch.allclose(zero_pad, huge_pad, atol=1e-7, rtol=0)
-        # QR and P_fb each own an identity-valued ST factor.  Averaging their
-        # cosine surrogates would halve these gradients and violate the method.
-        assert torch.allclose(zero_pad, expected_gradient, atol=1e-6, rtol=0)
-
-
-def test_selected_document_identity_st_rejects_non_corpus_evidence():
-    model = _selected_document_st_fixture()
-    evidence = [[
-        _ScoredDoc(
-            doc_id="external",
-            text="not in the fixed index",
-            corpus_index=-1,
-            fused_score=1.0,
-        ),
-    ]]
-
-    with pytest.raises(ValueError, match="corpus-backed"):
-        model._apply_selected_doc_cosine_identity_st(
-            torch.ones(1, 1, 1, 3),
-            evidence,
-            torch.tensor([[0.6, 0.8]]),
-        )

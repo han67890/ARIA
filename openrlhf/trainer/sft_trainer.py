@@ -45,52 +45,6 @@ def _scalar_loss_tensor(value: Any, reference: torch.Tensor, name: str) -> torch
     return result
 
 
-def normalize_likelihood_for_global_token_mean(
-    local_mean_loss: torch.Tensor,
-    outputs: Dict[str, Any],
-    strategy: Any,
-) -> torch.Tensor:
-    """Convert a rank-local causal-LM mean to the global-minibatch mean."""
-    if "target_token_count" not in outputs:
-        raise KeyError("paper likelihood paths require target_token_count")
-    target_count = outputs["target_token_count"]
-    if not isinstance(target_count, torch.Tensor):
-        raise TypeError("target_token_count must be a scalar integer tensor")
-    return strategy.scale_loss_to_global_token_mean(local_mean_loss, target_count)
-
-
-def accumulate_aria_eval_loss_metrics(
-    eval_metrics: Dict[str, float],
-    loss_terms: Dict[str, torch.Tensor],
-    outputs: Dict[str, Any],
-    batch_size: int,
-) -> None:
-    """Accumulate QA by target token and MSE by example for exact eval means."""
-    target_count = outputs.get("target_token_count")
-    if not isinstance(target_count, torch.Tensor) or target_count.numel() != 1:
-        raise TypeError("target_token_count must be a scalar integer tensor")
-    if target_count.dtype == torch.bool or torch.is_floating_point(target_count):
-        raise TypeError("target_token_count must be a scalar integer tensor")
-    target_count_value = int(target_count.detach().item())
-    if target_count_value <= 0:
-        raise ValueError("target_token_count must be positive")
-    if batch_size <= 0:
-        raise ValueError("evaluation batch_size must be positive")
-
-    # QA is a token mean, while Eq. 4 is an example mean. Keeping separate
-    # numerators prevents a rank-scaled QA mean from being reweighted by the
-    # local number of examples during evaluation aggregation.
-    eval_metrics["qa_loss_sum"] += (
-        loss_terms["qa_loss"].detach().item() * target_count_value
-    )
-    eval_metrics["target_tokens"] += target_count_value
-    for name in ("mse_loss", "weighted_mse_loss"):
-        eval_metrics[f"{name}_sum"] += (
-            loss_terms[name].detach().item() * batch_size
-        )
-    eval_metrics["samples"] += batch_size
-
-
 def compose_aria_training_loss(
     qa_loss: torch.Tensor,
     outputs: Dict[str, Any],
@@ -432,10 +386,6 @@ class SFTTrainer(ABC):
                     stage2_mips=self.args.stage2_mips,
                     stage2_retrieval_top_n=self.args.stage2_retrieval_top_n
                 )
-                loss = normalize_likelihood_for_global_token_mean(
-                    loss, outputs, self.strategy
-                )
-
                 # Phase II: QA plus the hidden-state alignment term.
                 total_loss, loss_terms = compose_aria_training_loss(
                     loss, outputs, args
@@ -645,7 +595,6 @@ class SFTTrainer(ABC):
         # Initialize evaluation metrics
         eval_metrics = {
             "qa_loss_sum": 0.0,
-            "target_tokens": 0,
             "mse_loss_sum": 0.0,
             "weighted_mse_loss_sum": 0.0,
             "samples": 0,
@@ -673,9 +622,11 @@ class SFTTrainer(ABC):
 
                 # Basic metrics
                 batch_size = len(batch["answers"])
-                accumulate_aria_eval_loss_metrics(
-                    eval_metrics, loss_terms, outputs, batch_size
-                )
+                for name in ("qa_loss", "mse_loss", "weighted_mse_loss"):
+                    eval_metrics[f"{name}_sum"] += (
+                        loss_terms[name].detach().item() * batch_size
+                    )
+                eval_metrics["samples"] += batch_size
 
                 # Retrieval metrics
                 if self.args.stage == "stage2" and "topk_doc_ids" in outputs:
@@ -760,10 +711,8 @@ class SFTTrainer(ABC):
 
         # Basic metrics
         if eval_metrics["samples"] > 0:
-            if eval_metrics["target_tokens"] <= 0:
-                raise ValueError("evaluation requires at least one target token")
             final_metrics["eval_qa_loss"] = (
-                eval_metrics["qa_loss_sum"] / eval_metrics["target_tokens"]
+                eval_metrics["qa_loss_sum"] / eval_metrics["samples"]
             )
             for name in ("mse_loss", "weighted_mse_loss"):
                 final_metrics[f"eval_{name}"] = (

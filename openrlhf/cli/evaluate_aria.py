@@ -55,11 +55,9 @@ from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from tqdm import tqdm
 
 from openrlhf.models.modeling_aria import (
-    ARIA_LIKELIHOOD_REDUCTION,
     ARIA_NO_COMPRESSION_CONFIGURATION,
     ARIA_NO_COMPRESSION_CONTEXT_CEILING,
     ARIA_NO_COMPRESSION_CONTEXT_POLICY,
-    ARIA_NO_COMPRESSION_MAX_NEW_TOKENS,
     ARIA_NO_COMPRESSION_SCHEME,
     CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
     CLARA_ARCHIVE_PAGE_ID_SCHEME,
@@ -71,7 +69,7 @@ from openrlhf.models.modeling_aria import (
     COUPLING_CONTROL_PROTOCOL,
     CLaRa,
     CLaRaConfig,
-    CFRS_FIDELITY_SCHEME,
+    CFRS_RECONSTRUCTION_SCHEME,
     MATCHED_EVIDENCE_TOKEN_BUDGET,
     MTFRL_INITIALIZATION_SCHEME,
     ORACLE_TOP100_PROTOCOL,
@@ -1490,7 +1488,7 @@ class ARIAEvaluator:
                 "retrieval_mode": "normal",
                 "retrieval_stages": ["QCA", "AHR", "IGFR", "MADS", "CCEF"],
                 "retrieval_rounds": 1,
-                "selected_document_ceiling": 5,
+                "selected_document_count": 5,
                 "document_order": "first-pass CCEF order",
                 "document_separator": "two-newlines",
                 "memory_compression": False,
@@ -1500,7 +1498,7 @@ class ARIAEvaluator:
                 "context_policy": ARIA_NO_COMPRESSION_CONTEXT_POLICY,
                 "protocol_context_ceiling": ARIA_NO_COMPRESSION_CONTEXT_CEILING,
                 "effective_context_ceiling": self.no_compression_context_limit,
-                "passage_truncation": False,
+                "passage_truncation": "right-only-if-32k-context-would-overflow",
                 "decoding": "greedy-one-beam-eos-or-64",
             }
             if self.no_compression
@@ -1765,9 +1763,9 @@ class ARIAEvaluator:
                                 "Padded retrieval indices must use trailing -1 values only"
                             )
                         index_row = index_row[:first_padding]
-                    if not 1 <= len(index_row) <= 5:
+                    if len(index_row) != 5:
                         raise RuntimeError(
-                            "Paper CCEF returns between one and five survivors; "
+                            "Paper CCEF returns exactly five survivors; "
                             f"batch row {row_index} returned {len(index_row)}"
                         )
                     if any(
@@ -1842,11 +1840,10 @@ class ARIAEvaluator:
                             document_tokens <= 0
                             or prompt_tokens <= 0
                             or context_ceiling != self.no_compression_context_limit
-                            or prompt_tokens + max_new_tokens > context_ceiling
                         ):
                             raise RuntimeError(
                                 "ARIA-NoComp diagnostics violate the direct-context "
-                                "no-truncation protocol"
+                                "top-five/32k protocol"
                             )
                         direct_context_document_tokens.append(document_tokens)
                         direct_context_prompt_tokens.append(prompt_tokens)
@@ -2832,9 +2829,8 @@ def _validate_checkpoint_protocol(
         "aria_text_sha256_scheme": TEXT_SHA256_SCHEME,
         "qr_input_scheme": QR_INPUT_SCHEME,
         "mtfrl_initialization_scheme": MTFRL_INITIALIZATION_SCHEME,
-        "cfrs_fidelity_scheme": CFRS_FIDELITY_SCHEME,
+        "cfrs_reconstruction_scheme": CFRS_RECONSTRUCTION_SCHEME,
         "retrieval_straight_through_scheme": RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
-        "aria_likelihood_reduction": ARIA_LIKELIHOOD_REDUCTION,
     }
     for key, expected in canonical_architecture.items():
         if getattr(config, key, None) != expected:
@@ -2842,13 +2838,6 @@ def _validate_checkpoint_protocol(
                 f"Checkpoint architecture {key!r} must be {expected!r}, "
                 f"got {getattr(config, key, None)!r}"
             )
-    acr_training_gate = getattr(config, "aria_acr_training_gate", None)
-    if acr_training_gate not in {"soft", "hard_st"}:
-        raise ValueError(
-            "Checkpoint must record aria_acr_training_gate as 'soft' or 'hard_st'"
-        )
-    if getattr(config, "acr_training_gate", acr_training_gate) != acr_training_gate:
-        raise ValueError("Checkpoint ACR training-gate metadata is inconsistent")
     expected_loss_weights = {
         "lambda_mse": 0.0 if checkpoint_configuration == "clara_baseline" else 0.10
     }
@@ -2932,7 +2921,7 @@ def _validate_checkpoint_protocol(
     }:
         if getattr(config, "mtfrl_initialization_rank", None) is not None:
             raise ValueError(
-                "Paper MTFRL uses Xavier-uniform initialization, not a low-rank factor"
+                "Paper MTFRL uses W_BGE-derived initialization, not a low-rank factor"
             )
         decoder_hidden_size = int(model.decoder.config.hidden_size)
         if decoder_hidden_size % 2 != 0:
@@ -3135,7 +3124,6 @@ def _validate_checkpoint_protocol(
             getattr(config, "compr_linear_type", None),
             bool(getattr(config, "compr_rms_norm", False)),
             getattr(config, "training_form", None),
-            acr_training_gate,
             compression_rate,
             phase1_manifest,
             phase1_test_digest,
@@ -3437,27 +3425,6 @@ def main() -> None:
         for _, checkpoint_path in seed_checkpoints
     ]
     first_checkpoint_config = checkpoint_configs[0]
-    checkpoint_acr_training_gates = [
-        getattr(config, "aria_acr_training_gate", None)
-        for config in checkpoint_configs
-    ]
-    if any(
-        gate not in {"soft", "hard_st"}
-        for gate in checkpoint_acr_training_gates
-    ):
-        parser.error(
-            "every checkpoint must record aria_acr_training_gate as "
-            "'soft' or 'hard_st'"
-        )
-    if len(set(checkpoint_acr_training_gates)) != 1:
-        parser.error("all reported checkpoints must use the same ACR training gate")
-    first_acr_training_gate = checkpoint_acr_training_gates[0]
-    if any(
-        getattr(config, "acr_training_gate", first_acr_training_gate)
-        != first_acr_training_gate
-        for config in checkpoint_configs
-    ):
-        parser.error("checkpoint ACR training-gate metadata is inconsistent")
     training_index_sha256 = getattr(
         first_checkpoint_config, "aria_training_retrieval_index_sha256", None
     )
@@ -3572,7 +3539,6 @@ def main() -> None:
         rag_config = _create_evaluation_rag_config(
             expected_configuration,
             args.compression_rate,
-            acr_training_gate=first_acr_training_gate,
         )
 
         checkpoint_results: List[Dict[str, Any]] = []
@@ -3709,9 +3675,6 @@ def main() -> None:
             )
 
     result_prefix = "aria" if expected_configuration == "full" else expected_configuration
-    gate_suffix = (
-        "" if first_acr_training_gate == "soft" else f"_gate{first_acr_training_gate}"
-    )
     compression_label = (
         f"cr1_sourcecr{args.compression_rate}"
         if is_no_compression
@@ -3719,7 +3682,7 @@ def main() -> None:
     )
     output_path = os.path.join(
         args.output_dir,
-        f"{result_prefix}_{args.dataset}_{compression_label}{gate_suffix}.json",
+        f"{result_prefix}_{args.dataset}_{compression_label}.json",
     )
     significance = None
     if args.baseline_results is not None:
@@ -3741,7 +3704,6 @@ def main() -> None:
             "retrieval_mode": args.retrieval_mode,
             "compression_rate": 1 if is_no_compression else args.compression_rate,
             "source_checkpoint_compression_rate": args.compression_rate,
-            "acr_training_gate": first_acr_training_gate,
             "training_seeds": [seed for seed, _ in seed_checkpoints],
             "checkpoints": [path for _, path in seed_checkpoints],
             "inference_seed": args.inference_seed,

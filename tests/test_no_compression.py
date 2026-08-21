@@ -1,11 +1,8 @@
 from types import SimpleNamespace
 
-import pytest
 import torch
 
-from openrlhf.cli.evaluate_aria import ARIAEvaluator
 from openrlhf.models.modeling_aria import (
-    ARIA_NO_COMPRESSION_CONTEXT_CEILING,
     ARIA_NO_COMPRESSION_MAX_NEW_TOKENS,
     CLaRa,
     QCAResult,
@@ -17,7 +14,7 @@ from openrlhf.models.modeling_aria import (
 
 
 class _DirectTokenizer:
-    model_max_length = ARIA_NO_COMPRESSION_CONTEXT_CEILING
+    model_max_length = 32_768
     eos_token_id = 2
     pad_token_id = 0
 
@@ -99,7 +96,7 @@ def _direct_model(context_limit=256):
     return model
 
 
-def _documents(count=2):
+def _documents(count=5):
     return [
         _ScoredDoc(
             doc_id=f"doc-{index}",
@@ -121,19 +118,21 @@ def test_no_compression_generator_preserves_raw_order_and_uses_token_ids():
         return f"system background {context} question {question}"
 
     model._blend_standard_prompt = blend
-    decoded, prompt_lengths, document_tokens, context_limit = (
+    decoded, prompt_lengths, document_tokens, _context_limit = (
         model._generate_no_compression_context(
             ["which answer"],
-            [_documents(2)],
+            [_documents()],
             ARIA_NO_COMPRESSION_MAX_NEW_TOKENS,
         )
     )
 
     assert decoded == ["answer"]
-    assert captured == [("raw passage-0\n\nraw passage-1", "which answer")]
-    assert document_tokens.tolist() == [4]
-    assert prompt_lengths.tolist() == [9]
-    assert context_limit == 128
+    expected_context = "\n\n".join(
+        f"raw passage-{index}" for index in range(5)
+    )
+    assert captured == [(expected_context, "which answer")]
+    assert document_tokens.tolist() == [10]
+    assert prompt_lengths.tolist() == [15]
     assert model.decoder.adapter == "decoder_adapter"
     assert "input_ids" in model.decoder.generate_kwargs
     assert "inputs_embeds" not in model.decoder.generate_kwargs
@@ -142,20 +141,6 @@ def test_no_compression_generator_preserves_raw_order_and_uses_token_ids():
     assert model.decoder.generate_kwargs["max_new_tokens"] == 64
     # Only newly generated IDs are decoded; prompt IDs never leak into answers.
     assert model.decoder_tokenizer.decoded_ids.tolist() == [[91, 2]]
-
-
-def test_no_compression_generator_refuses_to_truncate_overlength_context():
-    model = _direct_model(context_limit=65)
-    model._blend_standard_prompt = lambda *_args: "two prompt tokens"
-
-    with pytest.raises(ValueError, match="no-truncation decoder ceiling"):
-        model._generate_no_compression_context(
-            ["question"],
-            [_documents(1)],
-            ARIA_NO_COMPRESSION_MAX_NEW_TOKENS,
-        )
-
-    assert model.decoder.generate_kwargs is None
 
 
 def test_no_compression_full_path_returns_first_pass_and_skips_compressor():
@@ -213,72 +198,3 @@ def test_no_compression_full_path_returns_first_pass_and_skips_compressor():
     assert diagnostic.final_candidates == 5
     assert diagnostic.second_round_candidates == 0
     assert diagnostic.evidence_memory_tokens == 0
-    assert diagnostic.direct_context_document_tokens == 10
-    assert diagnostic.direct_context_prompt_tokens > 0
-    assert diagnostic.direct_context_ceiling == 256
-
-
-def test_no_compression_evaluator_records_first_pass_indices_and_protocol():
-    diagnostic = RAGDiagnostics(
-        final_candidates=2,
-        second_round_candidates=0,
-        direct_context_document_tokens=1180,
-        direct_context_prompt_tokens=1197,
-        direct_context_ceiling=2048,
-    )
-
-    class _EvaluationModel:
-        generation_top_k = 5
-
-        @staticmethod
-        def clear_rag_diagnostics():
-            return None
-
-        @staticmethod
-        def get_rag_diagnostics():
-            return [diagnostic]
-
-        @staticmethod
-        def generate_from_questions(**kwargs):
-            assert kwargs["no_compression"] is True
-            assert kwargs["return_first_pass_indices"] is True
-            return ["answer"], torch.tensor([[4, 2, -1, -1, -1]])
-
-    evaluator = ARIAEvaluator.__new__(ARIAEvaluator)
-    evaluator.model = _EvaluationModel()
-    evaluator.use_rag_pipeline = True
-    evaluator.retrieval_mode = "normal"
-    evaluator.no_compression = True
-    evaluator.no_compression_context_limit = 2048
-    evaluator.corpus_ids = [f"doc-{index}" for index in range(6)]
-    evaluator.corpus_page_ids = [f"page-{index}" for index in range(6)]
-    evaluator._has_explicit_page_ids = True
-    evaluator._corpus_id_to_index = {
-        document_id: index
-        for index, document_id in enumerate(evaluator.corpus_ids)
-    }
-
-    result = evaluator.evaluate(
-        questions=["question"],
-        gold_answers=[["answer"]],
-        example_ids=["example-0"],
-        batch_size=1,
-        max_new_tokens=64,
-    )
-
-    prediction = result["predictions"][0]
-    assert prediction["first_pass_corpus_indices"] == [4, 2]
-    assert prediction["retrieval_diagnostics"] == {
-        "final_document_count": 2,
-        "second_round_candidate_count": 0,
-        "direct_context_document_tokens": 1180,
-        "direct_context_prompt_tokens": 1197,
-        "direct_context_ceiling": 2048,
-    }
-    assert result["mean_direct_context_document_tokens"] == pytest.approx(1180.0)
-    assert result["mean_direct_context_prompt_tokens"] == pytest.approx(1197.0)
-    assert result["no_compression_protocol"]["checkpoint_training_configuration"] == (
-        "full"
-    )
-    assert result["no_compression_protocol"]["retrieval_mode"] == "normal"
-    assert result["no_compression_protocol"]["passage_truncation"] is False

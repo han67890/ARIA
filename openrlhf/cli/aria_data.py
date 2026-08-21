@@ -376,7 +376,7 @@ def _normalize_phase1_row(
         _require_field(row, field_map.input_key, location=location),
         location=f"{location}.{field_map.input_key}",
     )
-    instruction = _require_nonempty_string(
+    _instruction = _require_nonempty_string(
         _require_field(row, field_map.instruction_key, location=location),
         location=f"{location}.{field_map.instruction_key}",
     )
@@ -421,7 +421,9 @@ def _normalize_phase1_row(
     )
     return {
         "docs": [document],
-        "question": instruction,
+        # Phase I retains the four released target families but conditions the
+        # decoder only on F(d), never on the source task instruction.
+        "question": "",
         "answer": target,
         "pos_index": [0],
         "data_type": PHASE1_DATA_TYPES[source_name],

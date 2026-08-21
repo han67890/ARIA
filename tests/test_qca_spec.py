@@ -16,10 +16,6 @@ def test_qca_rule_table_is_complete_and_single_sourced():
     assert _QCA_RULE_WEIGHTS == {
         rule["id"]: float(rule["weight"]) for rule in payload["rules"]
     }
-    assert payload["classification"]["conflict_precedence"] == [
-        "explicit_hop:H02-H05",
-        "explicit_aspect:A01-A06",
-        "remaining_hop",
-        "remaining_aspect",
-        "simple",
-    ]
+    classification = payload["classification"]
+    assert classification["multi_hop_min_entities"] == 2
+    assert classification["hop_precedes_aspect"] is True

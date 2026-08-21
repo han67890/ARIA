@@ -61,7 +61,7 @@ evaluator maps document IDs to canonical page URLs, retains the first ranked
 passage per page, and records Normal Recall@5. It averages Recall only over
 `Q_sup`, rows with at least one annotated support page; rows with an explicit
 empty list remain in answer evaluation but not the Recall denominator. This
-follows Appendix A.35: the up-to-five pages come from the first-pass retrieval
+follows Appendix A.35: the five pages come from the first-pass retrieval
 pipeline, before MTFRL's second round and CFRS. The external CLaRa archives
 contain candidate-relative `pos_index`
 annotations in some retained members, but lack positive labels aligned to

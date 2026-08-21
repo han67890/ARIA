@@ -9,6 +9,29 @@ called out even when they remain backward-compatible at the API level.
 
 ### Changed
 
+- Aligned the implementation and public contract with the method described in
+  the accepted manuscript.
+- Restored QCA's Multi-Hop requirement (a hop rule plus at least two entities),
+  hop-over-aspect conflict handling, and confidence-conditioned AHR fallback
+  toward balanced BM25/dense weights.
+- Restored the literal epsilon-normalized ACR rates and the submission's
+  differentiable sigmoid soft mask. Removed the later hard-ST experiment and
+  its checkpoint/CLI protocol from the paper contract.
+- Restored four-family, memory-only held-out-target conditioning in Phase I and the
+  exact two-term Phase-II objective `L_QA + 0.10 L_MSE`, where `L_MSE` is the
+  example mean of the unnormalized squared L2 hidden-state distance.
+- Restored CFRS as the differentiable conditional-reconstruction fidelity
+  path and MTFRL as a fixed-five-document hard-prefix average initialized from
+  the pre-fitted `W_BGE` map.
+- Restored the fixed top-five CCEF contract and removed later method-only
+  checkpoint requirements, including physical-global likelihood-reduction,
+  selected-document cosine-ST, hidden-mean CFRS, and hard-gate metadata.
+- Kept ARIA-NoComp as the submission's existing fixed-checkpoint top-five
+  direct-context diagnostic, without presenting later native-window
+  no-truncation failure rules as a new paper protocol.
+- Documented release conventions separately from manuscript requirements:
+  continuous confidence interpolation and fail-fast five-document validation
+  affect only otherwise unspecified edges.
 - Added the canonical public repository URL and author affiliation to citation
   metadata and documentation.
 - Narrowed lightweight package/CI support to Python 3.10--3.11 after the Python
@@ -23,27 +46,6 @@ called out even when they remain backward-compatible at the API level.
   CLaRa now requires an explicit `--clara_archive_dir`; all four files, raw ZIP
   digests, required members, candidate fingerprints, and exact question joins
   are validated fail-closed.
-- Synchronized the full method contract with the camera-ready manuscript:
-  Phase II now optimizes `L_QA + 0.10 L_MSE`; selected-document cosine
-  straight-through factors carry that objective to QR and `P_fb` while keeping
-  retrieval hard in the forward pass. Likelihood terms now use an exact
-  data-parallel global target-token mean rather than an equal mean of rank-local
-  means.
-- Replaced the legacy frozen-decoder probability proxy with the paper's
-  per-document memory/non-memory hidden-mean CFRS score.
-- Made the ACR singleton/all-tied conventions and exact non-tied maximum
-  explicit, added independently selectable soft and hard-ST training gates,
-  and preserved hard thresholding at inference.
-- Normalized MTFRL memory summaries before projection and its BGE query after
-  projection, and fixed QCA conflict resolution with an explicit precedence
-  chain.
-- Added the evaluator-only `no_compression` protocol for the paper's
-  ARIA-NoComp diagnostic: it requires full Phase-II checkpoints and Normal
-  retrieval, preserves up to five first-pass CCEF passages without truncation,
-  and records `cr1_sourcecr*` context and retrieval provenance in JSON output.
-- Documented the four-category Phase-I objective, two-term Phase-II objective,
-  distinct passage/query/input/target/evaluation limits, and the executable
-  gradient contract.
 - Removed the obsolete MiniLM MADS console entry from package metadata.
 - Separated the 16x budget/topology-matched coupling retraining controls from
   fixed-checkpoint forward interventions. `remove_all_coupling` now denotes

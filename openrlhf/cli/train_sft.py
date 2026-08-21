@@ -37,7 +37,6 @@ from openrlhf.datasets.utils import blending_datasets
 from openrlhf.trainer.sft_trainer import SFTTrainer
 from openrlhf.utils import get_strategy, get_tokenizer
 from openrlhf.models.modeling_aria import (
-    ARIA_LIKELIHOOD_REDUCTION,
     CLARA_DOCUMENT_REPRESENTATION_SCHEME,
     CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
     CLARA_ARCHIVE_PAGE_ID_SCHEME,
@@ -55,7 +54,6 @@ from openrlhf.models.modeling_aria import (
     CLaRaConfig,
     CLaRa,
     QR_INPUT_SCHEME,
-    RAGPipelineConfig,
     create_paper_rag_config,
     _tensor_is_finite_in_chunks,
 )
@@ -715,12 +713,10 @@ def setup_phase2_artifacts(args: argparse.Namespace, model: CLaRa) -> None:
         args.rag_configuration,
         args.compress_rate,
         top_k=args.generation_top_k,
-        acr_training_gate=args.acr_training_gate,
     )
     model.config.aria_rag_configuration = args.rag_configuration
     model.config.aria_coupling_control_protocol = COUPLING_CONTROL_PROTOCOL
     model.config.aria_acr_allocation_mode = rag_config.acr_allocation_mode
-    model.config.aria_acr_training_gate = rag_config.acr_training_gate
     model.config.aria_second_retrieval_mode = rag_config.second_retrieval_mode
     model.config.aria_uniform_evidence_token_budget = (
         MATCHED_EVIDENCE_TOKEN_BUDGET
@@ -931,7 +927,6 @@ def create_clara_config(args: argparse.Namespace) -> CLaRaConfig:
         sep=True,
         attn_implementation="flash_attention_2" if args.flash_attn else "sdpa",
         stage2_retrieval_top_n=args.stage2_retrieval_top_n,
-        acr_training_gate=args.acr_training_gate,
         pure_inference=args.pure_inference
     )
 
@@ -964,7 +959,6 @@ def setup_model(args: argparse.Namespace) -> CLaRa:
                 ),
                 "aria_phase1_training_seed": int(args.seed),
                 "aria_phase1_test_url_sha256": current_test_digest,
-                "aria_likelihood_reduction": ARIA_LIKELIHOOD_REDUCTION,
             }
             for key, expected in expected_phase1.items():
                 actual = getattr(phase1_config, key, None)
@@ -1008,7 +1002,6 @@ def setup_model(args: argparse.Namespace) -> CLaRa:
             generation_top_k=args.generation_top_k,
             doc_max_length=args.doc_max_length,
             compr_rate=args.compress_rate,
-            acr_training_gate=args.acr_training_gate,
             aria_rag_configuration=args.rag_configuration,
             lora_target_modules=(
                 "all-linear"
@@ -1037,7 +1030,6 @@ def setup_model(args: argparse.Namespace) -> CLaRa:
         name: (float(getattr(args, name)) if args.stage == "stage2" else 0.0)
         for name in _PAPER_PHASE2_LOSS_WEIGHTS
     }
-    model.config.aria_likelihood_reduction = ARIA_LIKELIHOOD_REDUCTION
     if args.stage == "stage2" and args.rag_configuration == "clara_baseline":
         model.configure_clara_phase2_trainable_parameters()
     if not args.fit_bge_projection_only:
@@ -1050,7 +1042,10 @@ def setup_model(args: argparse.Namespace) -> CLaRa:
             "effective_batch_size": int(args.train_batch_size),
             "micro_batch_size_per_rank": int(args.micro_train_batch_size),
             "world_size": int(os.environ.get("WORLD_SIZE", "1")),
-            "gradient_accumulation_steps": 1,
+            "gradient_accumulation_steps": int(args.train_batch_size) // (
+                int(args.micro_train_batch_size)
+                * int(os.environ.get("WORLD_SIZE", "1"))
+            ),
             "max_gradient_norm": float(args.max_norm),
         }
     return model
@@ -1392,8 +1387,7 @@ def setup_datasets(args: argparse.Namespace, tokenizer, strategy, model: CLaRa):
             input_max_len=args.max_len,
             target_max_len=args.target_max_length,
         ),
-        # One optimizer step is one physical global minibatch (accumulation=1).
-        # Drop the deterministic tail so no partial paper minibatch crosses an
+        # Drop the deterministic tail so no partial effective batch crosses an
         # epoch boundary; Phase I has 7,808,465 rows, not a batch multiple.
         drop_last_multiple=(
             args.micro_train_batch_size * strategy.accumulated_gradient
@@ -1462,15 +1456,11 @@ def _training_step_counts(
 
 
 def _paper_warmup_steps(args: argparse.Namespace, max_steps: int) -> int:
-    """Resolve the phase-specific schedule exactly as reported in the paper."""
+    """Resolve the shared 500-step warmup reported for both phases."""
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
-    if args.stage == "stage1":
-        if args.lr_warmup_steps is not None:
-            raise ValueError("Phase I warmup is ratio-based")
-        return math.ceil(max_steps * args.lr_warmup_ratio)
     if args.lr_warmup_steps is None:
-        raise ValueError("Phase II requires an absolute warmup-step count")
+        raise ValueError("paper training requires an absolute warmup-step count")
     return int(args.lr_warmup_steps)
 
 
@@ -1578,9 +1568,9 @@ def _validate_feedback_initialization(model: CLaRa) -> None:
     if projection is None:
         raise RuntimeError("Full Phase II requires the trainable P_fb projection")
     scheme = getattr(model.config, "mtfrl_initialization_scheme", None)
-    if scheme != "xavier-uniform-zero-bias-v1":
+    if scheme != "w_bge_paired_gelu_identity_v1":
         raise RuntimeError(
-            "P_fb must record Xavier-uniform weights and zero biases; "
+            "P_fb must record its W_BGE-derived paired-GELU initialization; "
             f"got initialization scheme {scheme!r}"
         )
     weights: List[torch.Tensor] = []
@@ -1595,9 +1585,25 @@ def _validate_feedback_initialization(model: CLaRa) -> None:
     if any(not torch.isfinite(value).all() for value in weights + biases):
         raise RuntimeError("P_fb contains NaN or infinity at initialization")
     if any(torch.count_nonzero(value).item() == 0 for value in weights):
-        raise RuntimeError("P_fb contains an all-zero weight matrix instead of Xavier weights")
+        raise RuntimeError("P_fb contains an all-zero weight matrix")
     if any(torch.count_nonzero(value).item() != 0 for value in biases):
         raise RuntimeError("P_fb biases must be zero initialized")
+    if model._bge_projection is None:
+        raise RuntimeError("P_fb initialization requires W_BGE")
+    probe = torch.linspace(
+        -1.0,
+        1.0,
+        model.hidden_size,
+        device=weights[0].device,
+        dtype=weights[0].dtype,
+    ).unsqueeze(0)
+    with torch.no_grad():
+        expected = model._bge_projection(
+            probe.to(model._bge_projection.weight.dtype)
+        ).float()
+        actual = projection(probe).float()
+    if not torch.allclose(actual, expected, atol=2e-3, rtol=2e-3):
+        raise RuntimeError("fresh P_fb must execute W_BGE before joint training")
 
 
 def _validate_trainable_parameter_contract(args: argparse.Namespace, model: CLaRa) -> None:
@@ -1731,10 +1737,11 @@ def train(args: argparse.Namespace):
     # Configure strategy
     strategy = get_strategy(args)
     strategy.setup_distributed()
-    if strategy.accumulated_gradient != 1:
+    expected_accumulation = 2 if "qwen" in args.pretrain.lower() else 1
+    if strategy.accumulated_gradient != expected_accumulation:
         raise RuntimeError(
-            "Paper minibatch B must be materialized in one forward pass; "
-            "DeepSpeed gradient accumulation must equal 1"
+            "DeepSpeed gradient accumulation must match the paper protocol: "
+            f"expected {expected_accumulation}, got {strategy.accumulated_gradient}"
         )
 
     # Setup model
@@ -1844,15 +1851,6 @@ def create_argument_parser() -> argparse.ArgumentParser:
     clara_group.add_argument("--lambda_mse", type=float, default=0.1,
                             help="Phase-II MSE coefficient lambda (paper: 0.10)")
     clara_group.add_argument(
-        "--acr_training_gate",
-        choices=("soft", "hard_st"),
-        default="soft",
-        help=(
-            "ACR gate used during training: soft for the main model, hard_st "
-            "for the independently trained hard-gate analysis"
-        ),
-    )
-    clara_group.add_argument(
         "--rag_configuration",
         choices=sorted(_RAG_CONFIGURATION_SWITCHES),
         default="full",
@@ -1892,18 +1890,18 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Paper default is selected by phase: 3 in Phase I, 5 in Phase II",
     )
     training_group.add_argument("--learning_rate", type=float, default=None,
-                              help="Paper default: Phase I 1e-4; Phase II 2e-4 (Mistral/Llama) or 1.6e-4 (Qwen)")
+                              help="Paper default: 2e-4 (Mistral/Llama) or 1.6e-4 (Qwen)")
     training_group.add_argument(
         "--lr_warmup_steps",
         type=int,
         default=None,
-        help="Absolute warmup steps (Phase II paper default: 500; omit in Phase I)",
+        help="Absolute warmup steps (paper default: 500 in both phases)",
     )
     training_group.add_argument(
         "--lr_warmup_ratio",
         type=float,
-        default=0.03,
-        help="Phase-I warmup fraction (paper: 3%% of optimizer steps)",
+        default=0.0,
+        help=argparse.SUPPRESS,
     )
     training_group.add_argument("--lr_scheduler", type=str, default="cosine",
                               help="Learning rate scheduler")
@@ -1923,7 +1921,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--micro_train_batch_size",
         type=int,
         default=None,
-        help="Per-rank batch; defaults to effective_batch/WORLD_SIZE (no accumulation)",
+        help="Per-rank batch; Qwen uses the paper's 2x gradient accumulation",
     )
     distributed_group.add_argument(
         "--train_batch_size",
@@ -2021,21 +2019,15 @@ def validate_arguments(args: argparse.Namespace):
     if args.max_epochs is None:
         args.max_epochs = 3 if args.stage == "stage1" else 5
     if args.train_batch_size is None:
-        args.train_batch_size = (
-            16 if is_qwen else (128 if args.stage == "stage1" else 32)
-        )
+        args.train_batch_size = 16 if is_qwen else 32
     if args.max_len is None:
         args.max_len = phase_lengths["input"]
     if args.target_max_length is None:
         args.target_max_length = phase_lengths["target"]
-    if args.stage == "stage2" and args.lr_warmup_steps is None:
+    if args.lr_warmup_steps is None:
         args.lr_warmup_steps = 500
     if args.learning_rate is None:
-        args.learning_rate = (
-            1e-4
-            if args.stage == "stage1"
-            else (1.6e-4 if is_qwen else 2e-4)
-        )
+        args.learning_rate = 1.6e-4 if is_qwen else 2e-4
     if args.stage == "stage2" and args.rag_configuration == "clara_baseline":
         # The matched CLaRa control uses answer CE only.
         args.lambda_mse = 0.0
@@ -2129,32 +2121,32 @@ def validate_arguments(args: argparse.Namespace):
     if args.stage == "stage2" and args.disable_fast_tokenizer:
         raise ValueError("Phase-II Eq. (4) requires a fast tokenizer for query offsets")
 
-    expected_batch = 16 if is_qwen else (128 if args.stage == "stage1" else 32)
+    expected_batch = 16 if is_qwen else 32
     if args.train_batch_size != expected_batch:
         raise ValueError(
             f"Paper protocol requires global batch {expected_batch} for this backbone"
         )
     if args.micro_train_batch_size is None:
-        if expected_batch % world_size != 0:
+        expected_accumulation = 2 if is_qwen else 1
+        denominator = world_size * expected_accumulation
+        if expected_batch % denominator != 0:
             raise ValueError(
-                f"Effective batch {expected_batch} is not divisible by WORLD_SIZE={world_size}"
+                f"Effective batch {expected_batch} is not divisible by "
+                f"WORLD_SIZE*accumulation={denominator}"
             )
-        args.micro_train_batch_size = expected_batch // world_size
+        args.micro_train_batch_size = expected_batch // denominator
     if args.micro_train_batch_size <= 0:
         raise ValueError("micro_train_batch_size must be positive")
-    expected_lr = (
-        1e-4
-        if args.stage == "stage1"
-        else (1.6e-4 if is_qwen else 2e-4)
-    )
+    expected_lr = 1.6e-4 if is_qwen else 2e-4
     if not math.isclose(args.learning_rate, expected_lr, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError(f"Paper protocol requires learning_rate={expected_lr:g}")
     data_parallel_micro_batch = world_size * args.micro_train_batch_size
-    if data_parallel_micro_batch != expected_batch:
+    expected_accumulation = 2 if is_qwen else 1
+    if data_parallel_micro_batch * expected_accumulation != expected_batch:
         raise ValueError(
-            "Paper minibatch B is the global effective batch and does not use "
-            f"gradient accumulation: WORLD_SIZE ({world_size}) * micro batch "
-            f"({args.micro_train_batch_size}) must equal {expected_batch}"
+            "Paper effective batch mismatch: WORLD_SIZE "
+            f"({world_size}) * micro batch ({args.micro_train_batch_size}) * "
+            f"accumulation ({expected_accumulation}) must equal {expected_batch}"
         )
 
     if args.stage == "stage1":
@@ -2164,12 +2156,8 @@ def validate_arguments(args: argparse.Namespace):
             )
         if args.max_epochs != 3:
             raise ValueError("Paper-protocol Phase I requires exactly 3 epochs")
-        if args.lr_warmup_steps is not None:
-            raise ValueError(
-                "Paper-protocol Phase I uses a 3% warmup ratio, not absolute warmup steps"
-            )
-        if not math.isclose(args.lr_warmup_ratio, 0.03, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError("Paper-protocol Phase I requires lr_warmup_ratio=0.03")
+        if args.lr_warmup_steps != 500:
+            raise ValueError("Paper-protocol Phase I requires exactly 500 warmup steps")
         if args.generation_top_k != 1:
             raise ValueError("Phase I uses exactly one document per reconstruction pair")
     if args.stage == "stage2":
@@ -2179,8 +2167,7 @@ def validate_arguments(args: argparse.Namespace):
             raise ValueError("Paper-protocol Phase II uses a top-5 candidate ceiling")
         if args.stage2_retrieval_top_n != 5:
             raise ValueError(
-                "Paper-protocol Phase II keeps a first-five ceiling; CCEF may "
-                "produce 1-5 actual survivors via its threshold"
+                "Paper-protocol Phase II requires exactly five retained CCEF documents"
             )
         if args.lr_warmup_steps != 500:
             raise ValueError("Paper-protocol Phase II requires exactly 500 warmup steps")

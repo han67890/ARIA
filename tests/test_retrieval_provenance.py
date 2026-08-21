@@ -14,7 +14,6 @@ from openrlhf.cli.evaluate_aria import (
     load_doc_embeddings,
 )
 from openrlhf.models.modeling_aria import (
-    ARIA_LIKELIHOOD_REDUCTION,
     CLARA_DOCUMENT_REPRESENTATION_SCHEME,
     CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
     CLARA_ARCHIVE_PAGE_ID_SCHEME,
@@ -22,7 +21,7 @@ from openrlhf.models.modeling_aria import (
     CLARA_MEMORY_ALLOCATION_SCHEME,
     CLARA_PHASE2_OBJECTIVE,
     CLARA_SELECTOR_SCHEME,
-    CFRS_FIDELITY_SCHEME,
+    CFRS_RECONSTRUCTION_SCHEME,
     MTFRL_INITIALIZATION_SCHEME,
     QR_INPUT_SCHEME,
     RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
@@ -55,14 +54,7 @@ def _paper_checkpoint_model() -> SimpleNamespace:
     config = SimpleNamespace(
         decoder_model_resolved_revision="0" * 40,
         mads_semantic_model_name="BAAI/bge-large-en-v1.5",
-        mtfrl_initialization_scheme=MTFRL_INITIALIZATION_SCHEME,
-        mtfrl_initialization_rank=None,
         mtfrl_hidden_width=2048,
-        cfrs_fidelity_scheme=CFRS_FIDELITY_SCHEME,
-        retrieval_straight_through_scheme=RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
-        aria_acr_training_gate="soft",
-        aria_loss_weights={"lambda_mse": 0.10},
-        aria_likelihood_reduction=ARIA_LIKELIHOOD_REDUCTION,
         aria_compression_rate=16,
         aria_rag_configuration="full",
         aria_training_seed=42,
@@ -92,6 +84,10 @@ def _paper_checkpoint_model() -> SimpleNamespace:
         stage2_retrieval_top_n=5,
         aria_text_sha256_scheme=TEXT_SHA256_SCHEME,
         qr_input_scheme=QR_INPUT_SCHEME,
+        mtfrl_initialization_scheme=MTFRL_INITIALIZATION_SCHEME,
+        cfrs_reconstruction_scheme=CFRS_RECONSTRUCTION_SCHEME,
+        retrieval_straight_through_scheme=RETRIEVAL_STRAIGHT_THROUGH_SCHEME,
+        aria_loss_weights={"lambda_mse": 0.10},
         aria_test_url_sha256=digest,
         aria_phase1_training_seed=42,
         aria_phase1_dataset_manifest_sha256="c" * 64,
@@ -261,6 +257,7 @@ def test_checkpoint_fingerprint_labels_training_retrieval_provenance():
 def test_checkpoint_protocol_accepts_only_canonical_clara_baseline():
     model = _paper_checkpoint_model()
     model.config.aria_rag_configuration = "clara_baseline"
+    model.config.aria_loss_weights = {"lambda_mse": 0.0}
     model.config.lora_target_modules = "all-linear"
     model.config.clara_selector_scheme = CLARA_SELECTOR_SCHEME
     model.config.clara_document_representation_scheme = (
@@ -285,9 +282,6 @@ def test_checkpoint_protocol_accepts_only_canonical_clara_baseline():
     model.config.clara_selection_count = 5
     model.config.clara_archive_document_id_scheme = CLARA_ARCHIVE_DOCUMENT_ID_SCHEME
     model.config.clara_archive_page_id_scheme = CLARA_ARCHIVE_PAGE_ID_SCHEME
-    model.config.aria_loss_weights = {
-        "lambda_mse": 0.0,
-    }
     model.config.aria_trainable_parameter_names = [
         "decoder.lora_A.query_reasoner_adapter.weight",
         "decoder.lora_A.decoder_adapter.weight",
@@ -324,19 +318,6 @@ def test_checkpoint_protocol_requires_exact_base_decoder_revision():
     model = _paper_checkpoint_model()
     model.config.decoder_model_resolved_revision = None
     with pytest.raises(ValueError, match="exact resolved base-model revision"):
-        _validate_checkpoint_protocol(
-            model,
-            "checkpoint",
-            training_seed=42,
-            compression_rate=16,
-            expected_configuration="full",
-        )
-
-
-def test_checkpoint_protocol_requires_global_target_token_likelihood_reduction():
-    model = _paper_checkpoint_model()
-    model.config.aria_likelihood_reduction = "rank-local-token-mean"
-    with pytest.raises(ValueError, match="aria_likelihood_reduction"):
         _validate_checkpoint_protocol(
             model,
             "checkpoint",

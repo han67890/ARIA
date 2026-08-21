@@ -30,10 +30,10 @@ query
   → AHR (4,000 candidates)
   → IGFR for multi-hop gaps
   → MADS (100)
-  → CCEF (1–5 survivors; top-5 ceiling)
+  → CCEF (top 5)
   → ACR + compression
   → MTFRL dense second round (200)
-  → MADS + CCEF again (1–5 survivors; top-5 ceiling)
+  → MADS + CCEF again (top 5)
   → ACR + compression again
   → CFRS reranking
   → generator
@@ -41,31 +41,35 @@ query
 
 The three retrieval--compression operations are:
 
-- **CFRS (compression → retrieval):** each final passage receives a fidelity
-  score from the coordinate mean squared distance between its mean memory and
-  non-memory compressor states. Reverse min--max-normalized errors are blended
-  into the final ordering with weight `0.30`.
+- **CFRS (compression → retrieval):** each final passage receives a
+  reconstruction-fidelity error from its compressed memory. Reverse
+  min--max-normalized errors are blended into the final ordering with weight
+  `0.30`; normalization statistics are detached while the local error remains
+  differentiable, supplying the compressor-side gradient specified by the
+  submission method.
 - **ACR (retrieval → compression):** CCEF relevance sets each document's
   scale in `[0.25, 1.0]`; a sigmoid gate with `beta=10` softly masks memory
-  positions in training and a `0.5` threshold produces the hard inference
-  allocation, with at least one token per passage.
-- **MTFRL (compression → retrieval):** a document-balanced mean over effective
-  memory tokens is mapped by a trainable two-layer GELU projection into BGE
-  space for exactly one 200-document second retrieval.
+  positions. The old-paper normalization retains its literal `+1e-6`
+  denominator rather than adding singleton or all-tied special cases.
+- **MTFRL (compression → retrieval):** the hard effective prefixes of the
+  five first-pass memories are averaged and mapped by a trainable two-layer
+  GELU projection into BGE space for one 200-document second retrieval. Its
+  initialization is derived from the fitted `W_BGE` projection.
 
-Training has two phases. Phase I trains the compressor LoRA with conditional
-generation targets from the complete 7,808,465-example SimpleQA, ComplexQA,
-Paraphrase, and Entity-Augmented mixture. Phase II trains the QR, compressor,
-and generator LoRA adapters plus every parameter of the feedback projection:
+Training has two phases. Phase I retains all four target families and trains
+the compressor LoRA to reconstruct each held-out target from memory tokens
+alone; the task instruction is not part of the decoder condition. Phase II
+trains the QR, compressor, and generator LoRA adapters plus the feedback
+projection:
 
 ```text
 L = L_QA + 0.10 L_MSE
 ```
 
-The language-model bases, pre-fitted `W_BGE`, BGE encoder/index, rules, and
-hard selection operations remain frozen or discrete. Identity-valued
-selected-document cosine bridges preserve the hard forward path while carrying
-QA/MSE gradients to QR and the feedback projection. See
+`L_MSE` is the example mean of the squared L2 distance between the memory and
+non-memory mean hidden states; it is not divided by hidden width. The
+language-model bases, pre-fitted `W_BGE`, BGE encoder/index, and rules remain
+frozen. See
 [the method contract](docs/method.md) and [training guide](docs/training.md) for
 the exact equations, loss paths, pool sizes, and defaults.
 
@@ -178,11 +182,9 @@ export TEST_URL_FILE=/data/official_test_urls.txt
 bash scripts/train_phase2.sh 16 checkpoints/aria_phase1_seed42_cr16 42
 ```
 
-The launchers enforce the paper's length contract: passage/query maxima
-`768/256`, Phase-I input/target maxima `2048/512`, Phase-II input/target maxima
-`1024/128`, and evaluation generation maximum `64`. They also fix the reported
-learning rates, warmup, effective batches, epoch counts, rank-16 `q_proj` LoRA,
-top-5 evidence, and the Phase-II MSE weight. `scripts/train_all_cr.sh`
+The launchers fix the submission protocol's compression ratios, epoch counts,
+rank-16 LoRA, fixed top-5 evidence set, and Phase-II MSE weight.
+`scripts/train_all_cr.sh`
 expands ratios `{4,16,32,64,128}` and run seeds `{42,123,456,789,2024}`.
 
 ## Inference
@@ -223,8 +225,8 @@ answers, per-checkpoint benchmark averaging, and paired two-sided bootstrap.
 only and are used solely as fingerprinted candidate pools; the evaluator never
 claims paper metrics from them or fabricates aliases.
 
-The paper's ARIA-NoComp diagnostic is an evaluator-only protocol. The reported
-row uses the five full Phase-II 16x checkpoints with Normal retrieval:
+The paper's ARIA-NoComp diagnostic uses the five full Phase-II 16x checkpoints
+with Normal retrieval:
 
 ```bash
 EVAL_DATA_PATH=/data/aria/eval \
@@ -234,17 +236,12 @@ RAG_CONFIGURATION=no_compression \
 bash scripts/evaluate.sh 16
 ```
 
-It runs the first QCA -> AHR -> IGFR -> MADS -> CCEF round, preserves the
-order of up to five survivors, joins those raw passages with two newlines, and feeds the
-standard QA prompt to the Phase-II decoder adapter as token IDs. It does not
-run compression, CFRS, ACR, or MTFRL. Decoding is greedy with one beam and at
-most 64 new tokens. Direct context is never truncated: the evaluator fails
-closed when the full prompt plus generation budget exceeds the smaller of the
-loaded model/tokenizer capacity and the fixed 32,768-token protocol ceiling.
-Results are labeled `cr1_sourcecr16` and record the first-pass corpus indices,
-effective ceiling, and mean raw-document/prompt token counts. The manuscript's
-approximately 590 tokens per passage and 2,950 raw context tokens per query are
-measurements, not truncation targets.
+It runs QCA -> AHR -> IGFR -> MADS -> CCEF once, concatenates the fixed top-five
+raw passages into the decoder context, and bypasses compression, CFRS, ACR,
+MTFRL, and the second retrieval round. No additional fine-tuning is performed;
+the Phase-II checkpoint remains frozen. The reported average context is about
+2,950 document tokens, within Mistral's 32k window. Separator choice and
+overlength handling are implementation details, not additional paper claims.
 
 It supports full-corpus Normal and a versioned Oracle top-100 protocol. Oracle
 retains the first BGE-ranked passage per canonical page URL, injects missing
@@ -259,8 +256,8 @@ fixed-checkpoint interventions and therefore reuse the aligned `full`
 checkpoint for each seed. The 16x matched-retraining labels are `remove_cfrs`,
 `uniform_acr`, `static_second_retrieval`, and `remove_all_coupling`; each needs
 its own five-seed checkpoint set. All retain
-the first-round construction, a D2 top-200 second round, final 1--5-document
-ceiling, and a target mean evidence budget of 108 tokens. By contrast,
+the first-round construction, a D2 top-200 second round, final top-five
+evidence set, and a target mean evidence budget of 108 tokens. By contrast,
 `forward_path_off` reuses each `full` checkpoint, sets rho=1, omits round two,
 and therefore has the paper's measured mean of 184 evidence tokens at 16x.
 

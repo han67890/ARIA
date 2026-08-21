@@ -2,14 +2,14 @@
   "source": "ARIA Appendix Tables A51-A52",
   "entity_types": ["PERSON", "ORG", "GPE", "LOC", "FAC", "EVENT", "PRODUCT", "WORK_OF_ART"],
   "classification": {
-    "multi_hop": "explicit H02-H05, otherwise any remaining hop indicator after explicit aspect checks",
-    "multi_aspect": "explicit A01-A06 when no explicit hop fires, otherwise any remaining aspect indicator after hop checks",
+    "multi_hop": "any hop indicator with at least two named entities",
+    "multi_aspect": "any aspect indicator when the guarded multi-hop route does not fire",
     "simple": "otherwise",
+    "multi_hop_min_entities": 2,
+    "hop_precedes_aspect": true,
     "conflict_precedence": [
-      "explicit_hop:H02-H05",
-      "explicit_aspect:A01-A06",
-      "remaining_hop",
-      "remaining_aspect",
+      "multi_hop_with_two_entities",
+      "multi_aspect",
       "simple"
     ]
   },

@@ -12,13 +12,7 @@ BASE_MODEL_REVISION="${BASE_MODEL_REVISION:-}"
 DATASET="${PHASE2_DATASET:-${ROOT_DIR}/data/aria/phase2}"
 NUM_GPUS="${NUM_GPUS:-8}"
 RAG_CONFIGURATION="${RAG_CONFIGURATION:-full}"
-ACR_TRAINING_GATE="${ACR_TRAINING_GATE:-soft}"
-if [[ "${ACR_TRAINING_GATE}" == "soft" ]]; then
-  ACR_GATE_SUFFIX=""
-else
-  ACR_GATE_SUFFIX="_gate${ACR_TRAINING_GATE}"
-fi
-OUTPUT_DIR="${PHASE2_OUTPUT_DIR:-${ROOT_DIR}/checkpoints/aria_phase2_${RAG_CONFIGURATION}${ACR_GATE_SUFFIX}_seed${SEED}_cr${CR}}"
+OUTPUT_DIR="${PHASE2_OUTPUT_DIR:-${ROOT_DIR}/checkpoints/aria_phase2_${RAG_CONFIGURATION}_seed${SEED}_cr${CR}}"
 
 CORPUS_PATH="${CORPUS_PATH:?set CORPUS_PATH to the de-duplicated fixed corpus}"
 TEST_URL_FILE="${TEST_URL_FILE:?set TEST_URL_FILE to official test page URLs}"
@@ -55,17 +49,19 @@ fi
 if [[ "${BASE_MODEL,,}" == *qwen* ]]; then
   LR="${LEARNING_RATE:-1.6e-4}"
   GLOBAL_BATCH=16
+  GRAD_ACCUMULATION=2
 else
   LR="${LEARNING_RATE:-2e-4}"
   GLOBAL_BATCH=32
+  GRAD_ACCUMULATION=1
 fi
-if (( NUM_GPUS <= 0 || GLOBAL_BATCH % NUM_GPUS != 0 )); then
-  echo "NUM_GPUS=${NUM_GPUS} must divide the paper effective batch ${GLOBAL_BATCH}" >&2
+if (( NUM_GPUS <= 0 || GLOBAL_BATCH % (NUM_GPUS * GRAD_ACCUMULATION) != 0 )); then
+  echo "NUM_GPUS*accumulation must divide paper batch ${GLOBAL_BATCH}" >&2
   exit 2
 fi
-MICRO_BATCH="${MICRO_BATCH_SIZE:-$((GLOBAL_BATCH / NUM_GPUS))}"
-if (( NUM_GPUS * MICRO_BATCH != GLOBAL_BATCH )); then
-  echo "Phase II forbids gradient accumulation: NUM_GPUS * MICRO_BATCH_SIZE must equal ${GLOBAL_BATCH}" >&2
+MICRO_BATCH="${MICRO_BATCH_SIZE:-$((GLOBAL_BATCH / NUM_GPUS / GRAD_ACCUMULATION))}"
+if (( NUM_GPUS * MICRO_BATCH * GRAD_ACCUMULATION != GLOBAL_BATCH )); then
+  echo "NUM_GPUS * MICRO_BATCH_SIZE * accumulation must equal ${GLOBAL_BATCH}" >&2
   exit 2
 fi
 REVISION_ARGS=()
@@ -90,7 +86,6 @@ torchrun --standalone --nproc_per_node="${NUM_GPUS}" -m openrlhf.cli.train_sft \
   --generation_top_k 5 \
   --stage2_retrieval_top_n 5 \
   --lambda_mse "${LAMBDA_MSE}" \
-  --acr_training_gate "${ACR_TRAINING_GATE}" \
   --rag_configuration "${RAG_CONFIGURATION}" \
   --max_epochs 5 \
   --learning_rate "${LR}" \

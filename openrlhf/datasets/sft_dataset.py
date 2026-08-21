@@ -18,7 +18,6 @@ import torch
 from typing import Callable, List, Tuple, Dict, Any, Optional
 from collections import defaultdict
 from torch.utils.data import Dataset
-from openrlhf.utils.utils import zero_pad_sequences
 
 
 PHASE1_DATA_TYPES = {
@@ -359,32 +358,20 @@ def make_collate_fn(
             zip(questions, answers, data_types)
         ):
             row_memory_counts = [int(memory_token_counts[row_index].item())]
-            if data_type == "paraphrase":
-                answer_text = _answer_to_text(a, location="Phase-I paraphrase answer")
-                prompt_responses.append(
-                    clara_model._blend_prompt_and_memory_tokens(
-                        query=q,
-                        answer=answer_text,
-                        paraphrase_loss=True,
-                        stage=clara_model.training_stage,
-                        memory_counts=row_memory_counts,
-                    )
+            answer_text = _answer_to_text(
+                a, location=f"Phase-I {data_type} paraphrase target"
+            )
+            # All four source families keep their released target y, but the
+            # decoder sees no source instruction/question: Eq. (2) conditions
+            # the reconstruction only on F(d).
+            prompt_responses.append(
+                clara_model._blend_prompt_and_memory_tokens(
+                    query="",
+                    answer=answer_text,
+                    stage="stage1_2",
+                    memory_counts=row_memory_counts,
                 )
-            else:
-                answer_text = _answer_to_text(
-                    a, location=f"Phase-I {data_type} target"
-                )
-                # Eq. (2) conditions on the source-provided task instruction I.
-                # Reuse the standard memory-conditioned prompt path; never
-                # invent a fixed instruction for these heterogeneous sources.
-                prompt_responses.append(
-                    clara_model._blend_prompt_and_memory_tokens(
-                        query=q,
-                        answer=answer_text,
-                        stage="stage1_2",
-                        memory_counts=row_memory_counts,
-                    )
-                )
+            )
 
         prompt_lengths = [pr[0] for pr in prompt_responses]
         instructions = [pr[1] for pr in prompt_responses]
@@ -616,9 +603,9 @@ def make_collate_fn(
         elif stage in ["stage2", "stage2_pretrain_retrieval"]:
             if any(data_type != "qa" for data_type in data_types):
                 raise ValueError("Every Phase-II row must use data_type='qa'")
-            # The canonical artifact carries the fixed BGE top-5 candidate
-            # ceiling. CCEF's fixed threshold determines how many (1-5) survive
-            # at runtime; it does not change the Arrow row schema.
+            # The canonical artifact carries five BGE candidates. CCEF retains
+            # exactly five real documents at runtime, so the Arrow row schema
+            # and decoder document count remain aligned.
             expected_candidates = generation_top_k
             _validate_document_batch(
                 docs_list,

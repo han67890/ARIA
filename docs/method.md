@@ -1,46 +1,33 @@
-# Paper method contract
+# Submission-method contract
 
-This guide is a compact implementation checklist for the current `ARIA.tex`.
-The manuscript remains authoritative for derivations, analyses, and results.
+This document describes the method in the submitted manuscript
+(`ARIA_old.tex`). Version 0.2.0 aligns the executable repository contract with
+that submission.
 
-## End-to-end order
+## Requirements stated by the submission
+
+### End-to-end path
 
 ```text
-QR(q) -> QCA -> AHR -> optional IGFR -> MADS(top 100) -> CCEF(1..5)
-      -> first ACR/compression -> one MTFRL search(top 200)
-      -> MADS(top 100) -> CCEF(1..5) -> final ACR/compression
-      -> CFRS ordering -> greedy generator
+QR(q) -> QCA -> AHR -> optional IGFR -> MADS(top 100) -> CCEF(top 5)
+      -> soft ACR/compression -> MTFRL search(top 200)
+      -> MADS(top 100) -> CCEF(top 5) -> soft ACR/compression
+      -> CFRS ordering -> generator
 ```
 
-The second MADS/CCEF pass reranks the document-ID-deduplicated union of
-first-pass survivors and MTFRL candidates. MADS stably sorts candidate passage
-occurrences by descending score (with document ID as the exact-tie key) and
-takes the first 100 directly; the Normal/training path does not deduplicate
-those candidates by page ID. Page-ID deduplication is confined to Oracle-pool
-construction and Recall@k accounting. ACR is recomputed on the final survivor set.
-CFRS changes order, not set membership. Retrieval, sorting, index lookup, and
-top-k decisions are hard in the forward pass; selected-document
-straight-through factors supply the training gradient described below.
+CCEF supplies the fixed five-document set used by ACR and MTFRL. MTFRL makes
+one additional dense retrieval, after which MADS and CCEF run once more. CFRS
+changes final order, not membership.
 
-## Query representation and first-pass retrieval
+### QCA and AHR
 
-The Query Reasoner (QR) is the frozen language-model base plus a Phase-II
-rank-16 `q_proj` LoRA. `q_rep` is its final-token hidden state for the native
-tokenizer encoding of the query. The fixed, pre-fitted map `W_BGE` projects it
-to the 1,024-dimensional BGE space.
+QCA evaluates 38 weighted surface rules. A query is Multi-Hop only when a hop
+rule fires and at least two named entities are present. When hop and aspect
+rules both fire, Multi-Hop takes precedence; otherwise an aspect match yields
+Multi-Aspect and the remaining queries are Simple.
 
-QCA applies the 38 declarative rules in
-`openrlhf/configs/qca_rules.json` to assign Simple, Multi-Aspect, or Multi-Hop
-and to instantiate IGFR templates. Its confidence is logged but does not route
-the model. QCA uses surface rules rather than `q_rep`. Conflicting matches use
-one deterministic precedence chain: explicit Multi-Hop phrases H02--H05,
-explicit Multi-Aspect phrases A01--A06, the remaining Multi-Hop rules, the
-remaining Multi-Aspect rules, then Simple. S12 is the fallback.
-
-AHR retrieves 4,000 BM25 and 4,000 frozen-BGE candidates, forms their
-deduplicated union, min--max-normalizes each channel over that union, and keeps
-the best 4,000 hybrid scores. Missing-channel entries receive that channel's
-minimum; an all-tied channel receives `0.5`. BM25/BGE weights are:
+QCA confidence is the matched-rule weight divided by total rule weight. AHR
+uses type-conditioned `(BM25, dense)` endpoints:
 
 | QCA type | BM25 | Dense BGE |
 |---|---:|---:|
@@ -48,127 +35,96 @@ minimum; an all-tied channel receives `0.5`. BM25/BGE weights are:
 | Multi-Aspect | 0.30 | 0.70 |
 | Multi-Hop | 0.25 | 0.75 |
 
-IGFR runs only for Multi-Hop queries with at least one extracted query entity
-and coverage below `gamma=0.5`. Each iteration uses the next unused QCA
-template, adds at most 200 candidates, and stops when coverage reaches the
-threshold or templates are exhausted. The maximum iteration count is 2 for
-nominal ratios 4--64 and 1 for ratio 128.
+Low confidence falls back toward `(0.5, 0.5)`.
 
-## MADS and CCEF
+### ACR
 
-MADS computes three raw axes for every current candidate:
-
-1. word-unigram TF--IDF cosine, fitted to the query and current pool;
-2. cosine between normalized `W_BGE q_rep` and the frozen
-   BGE-large-en-v1.5 document vector;
-3. spaCy `en_core_web_sm` named-entity coverage, or zero for no query entity.
-
-Each axis is independently min--max-normalized per query, with `0.5` for an
-all-tied axis. The equal-weight mean is the MADS score. Sorting is stable and
-uses corpus document ID for exact score ties; the best 100 continue. A
-separate MiniLM semantic encoder or index is not part of MADS.
-
-For normalized axis scores `s_j`, CCEF uses:
+For the five CCEF scores, ACR uses the literal old-paper normalization
 
 ```text
-agreement = clip(1 - population_std(s_j) / (mean(s_j) + 1e-6), 0, 1)
-fused = mean(s_j) * (0.5 + 0.5 * agreement)
+rho_i = rho_min + (rho_max-rho_min)
+        * (s_i-min_j s_j) / (max_j s_j-min_j s_j+1e-6)
 ```
 
-It keeps at most five passages with `fused >= 0.30`, preserving MADS order for
-exact fused-score ties. If none passes, it keeps the first passage attaining
-the maximum fused score. Downstream set size is therefore 1--5.
+with `rho_min=0.25`, `rho_max=1.0`. At position `t`, the memory state is
+multiplied by `sigmoid(10 * (rho_i * K_i - t))`. This is the differentiable
+soft mask used by the submitted method.
 
-## ACR
+The effective prefix length `T_i` is obtained from the `0.5` gate threshold for
+MTFRL pooling and allocation auditing. The generator continues to receive the
+soft sigmoid-gated states. ACR rates are detached inputs to the mask,
+preserving the submission's separation between allocation and CFRS gradient
+paths.
 
-For truncated passage length `L_i` and nominal ratio `r`, the pre-ACR memory
-length is:
+### CFRS
+
+CFRS measures per-document conditional reconstruction fidelity from compressed
+memory. The release computes the frozen decoder's teacher-forced next-token
+squared-probability error, averaged over valid passage targets. Lower error is
+better. Reverse min--max-normalized fidelity is blended with CCEF as
 
 ```text
-K0_i = max(1, floor(L_i / r))
+0.70 * s_fused + 0.30 * fidelity
 ```
 
-For a CCEF survivor set, fused scores are min--max-normalized and linearly
-mapped to `rho_i` in `[0.25, 1.0]`. A singleton receives `1.0`; a
-multi-document all-tied set receives the midpoint `0.625`; otherwise exact
-min--max normalization makes the highest score `1.0`. These rates are
-detached. At memory position `t=1..K0_i`, the main training configuration applies
-`g_it = sigmoid(10 * (rho_i*K0_i - t))` to the raw state. Inference retains raw
-states with `g_it >= 0.5`, falling back to the maximum-gate position if
-necessary. The independently trained hard-gate analysis uses the same binary
-mask in its forward pass and the sigmoid derivative in its backward pass
-(`--acr_training_gate hard_st`). Removed memory is not redistributed.
+The reconstruction error remains differentiable to the compressor. In the
+reverse normalization, the maximum, minimum, and
+`Delta = max(error)-min(error)+1e-6` statistics are detached while the local
+error is not, giving the appendix derivative `d fidelity_i / d error_i =
+-1/Delta`. The literal formula maps an all-tied set to zero in the forward
+pass and yields the local derivative `-1/1e-6`. Final sorting is hard in the
+forward pass, while the score surrogate preserves this submitted CFRS gradient
+path without adding an auxiliary loss.
 
-## MTFRL
+### MTFRL
 
-During training, MTFRL divides each document's gated-state sum by its gate
-mass, then gives every first-pass document equal weight. At inference it means
-the hard-retained raw states within each document and then across documents.
-The pooled state is L2-normalized before `P_fb`; its projected output is also
-normalized for cosine retrieval. `P_fb` is a trainable two-layer GELU map with
-Xavier-uniform weights and zero biases:
+MTFRL operates on exactly five first-pass documents. For each document it
+averages the hard effective prefix `m_i[1:T_i]`, then averages the five document
+means. A two-layer GELU projection maps this summary to the 1,024-wide BGE
+space and performs one top-200 dense search. Its initialization is derived from
+the pre-fitted `W_BGE` map, as specified by the submission.
 
-| Backbone | Dimensions |
-|---|---|
-| Mistral-7B / Llama-3-8B | 4096 -> 2048 -> 1024 |
-| Qwen-2.5-14B | 5120 -> 2560 -> 1024 |
+### Training objectives
 
-The feedback query performs exactly one top-200 search over the frozen BGE
-index. It is initialized independently of `W_BGE`.
+Phase I trains only the compressor adapter. It retains the four SimpleQA,
+ComplexQA, Paraphrase, and Entity-Augmented target families listed in the
+submission appendix, while the decoder reconstructs each held-out target from
+memory tokens alone. A task instruction is not part of the decoder condition.
 
-## CFRS and generation
-
-For every final survivor, CFRS compares the mean of its effective memory states
-with the mean of its valid non-memory compressor states. Its error is the
-coordinate mean squared distance between those vectors. A detached reverse
-min--max transform converts the errors to fidelity scores; if the error range
-is at most `1e-6`, every fidelity score is `0.5`. Final ordering uses
-`0.70 * CCEF + 0.30 * fidelity` with stable CCEF tie order. CFRS changes only
-the final document order and is distinct from the QA-pass alignment MSE.
-
-The generator consumes the CFRS-ordered final memories. Evaluation decoding is
-greedy, one beam, no sampling, and stops at EOS or 64 generated tokens.
-
-## ARIA-NoComp diagnostic
-
-ARIA-NoComp is an inference-only diagnostic over a full Phase-II checkpoint;
-it is not a trainable RAG configuration. Under Normal retrieval it reuses the
-first QCA -> AHR -> IGFR -> MADS -> CCEF result, takes up to five survivors in
-their current CCEF order, and joins their unmodified passage strings with two
-newlines. The resulting background is inserted into the same standard
-system/user QA prompt and passed to the Phase-II decoder adapter as ordinary
-token IDs. There are no memory embeddings and no compressor, ACR, CFRS, MTFRL,
-or second retrieval round.
-
-Decoding remains greedy, one beam, EOS or 64 new tokens. The context policy is
-deterministic and lossless: passages and prompts are not truncated, and an
-example fails closed if its complete prompt plus the 64-token output budget
-exceeds `min(32768, loaded decoder capacity, finite tokenizer capacity)`. This
-ceiling is intentionally independent of the 1,024-token compressed Phase-II
-input limit. Evaluation output records the first-pass corpus indices, raw
-document-token count, full prompt-token count, effective context ceiling, and
-the versioned protocol metadata. The reported ARIA-NoComp row uses the full
-16x Phase-II checkpoints; its approximately 590 tokens per passage and 2,950
-raw context tokens per query are observed statistics rather than cutoffs.
-
-## Training objective and frozen state
-
-Phase I trains only the compressor adapter on four conditional-generation
-categories. Phase II uses:
+Phase II uses exactly
 
 ```text
-L_QA + 0.10 L_MSE
+L = L_QA + 0.10 * L_MSE
 ```
 
-`L_MSE` is computed in the teacher-forced QA pass between the sequence means
-of valid memory states and valid query/gold-answer states, with a coordinate
-mean over hidden dimensions. It is separate from the per-document CFRS score.
+`L_MSE` is the example mean of the squared L2 distance between the mean memory
+hidden state and the mean non-memory query/answer hidden state in the same QA
+forward pass. The squared norm is summed over hidden coordinates; there is no
+`1/d_h` coordinate normalization. The complete scalar objective contains these
+two terms.
 
-Phase II updates the QR, compressor, and generator LoRA adapters plus all of
-`P_fb`. Language-model bases, `W_BGE`, the BGE encoder/index, and fixed
-retrieval rules remain frozen. Retrieval and ranking remain hard in the forward
-pass. On selected documents, identity-valued straight-through cosine factors
-against their frozen BGE vectors expose backward paths from QA/MSE to QR and
-`P_fb` without adding an auxiliary objective or changing inference. See
-[training.md](training.md) for initialization, lengths, batches, learning
-rates, and loss-path details.
+### ARIA-NoComp
+
+ARIA-NoComp is a fixed-checkpoint evaluation diagnostic. It runs the five
+retrieval stages once and concatenates the fixed top-five raw passages into the
+frozen Phase-II decoder context. Compression, CFRS, ACR, MTFRL, and the second
+retrieval round are bypassed, with no additional fine-tuning.
+
+## Implementation conventions for unspecified edges
+
+These conventions make omitted edge cases deterministic without changing the
+normal five-document paper path:
+
+- The release turns the manuscript's qualitative confidence fallback into a
+  continuous interpolation: `c=0` gives `(0.5, 0.5)` and `c=1` gives the
+  type-conditioned endpoint. This adds no threshold or learned parameter.
+- CCEF/MTFRL fail fast when thresholding cannot supply five real documents,
+  rather than silently changing the paper's `N=5` average.
+- MTFRL uses `T_i=max(1,floor(rho_i*K_i))` when a short document would
+  otherwise yield an empty prefix, making the manuscript's `1/T_i` mean
+  well-defined while leaving the generator's soft ACR states unchanged.
+- Hard final CFRS sorting uses an identity-valued permutation surrogate. It
+  keeps the submitted hard order in the forward pass and carries the
+  appendix's CFRS score derivative.
+- ARIA-NoComp uses deterministic raw-passage concatenation. The submission's
+  32k-window observation is retained as the reported capacity context.

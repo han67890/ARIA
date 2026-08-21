@@ -405,37 +405,26 @@ def test_recall_at_5_maps_first_pass_indices_to_stable_corpus_ids():
     assert aggregated["std"]["recall_at_5"] == 0.0
 
 
-def test_recall_at_5_accepts_ccef_survivor_sets_smaller_than_five():
+def test_recall_at_5_rejects_ccef_survivor_sets_smaller_than_five():
     evaluator, _ = _recall_evaluator([[1, 3, 5]])
-    result = evaluator.evaluate(
-        questions=["q"],
-        gold_answers=[["answer"]],
-        gold_doc_ids=[["doc-1", "doc-2"]],
-        batch_size=1,
-    )
-
-    assert result["predictions"][0]["retrieved_doc_ids"] == [
-        "doc-1",
-        "doc-3",
-        "doc-5",
-    ]
-    assert result["predictions"][0]["recall_at_5"] == pytest.approx(0.5)
+    with pytest.raises(RuntimeError, match="exactly five survivors"):
+        evaluator.evaluate(
+            questions=["q"],
+            gold_answers=[["answer"]],
+            gold_doc_ids=[["doc-1", "doc-2"]],
+            batch_size=1,
+        )
 
 
-def test_recall_at_5_strips_trailing_padding_from_variable_survivors():
+def test_recall_at_5_rejects_padded_variable_survivors():
     evaluator, _ = _recall_evaluator([[1, 3, 5, -1, -1]])
-    result = evaluator.evaluate(
-        questions=["q"],
-        gold_answers=[["answer"]],
-        gold_doc_ids=[["doc-1"]],
-        batch_size=1,
-    )
-
-    assert result["predictions"][0]["retrieved_doc_ids"] == [
-        "doc-1",
-        "doc-3",
-        "doc-5",
-    ]
+    with pytest.raises(RuntimeError, match="exactly five survivors"):
+        evaluator.evaluate(
+            questions=["q"],
+            gold_answers=[["answer"]],
+            gold_doc_ids=[["doc-1"]],
+            batch_size=1,
+        )
 
 
 def test_recall_at_5_deduplicates_pages_and_uses_gold_page_intersection():
@@ -456,7 +445,9 @@ def test_recall_at_5_deduplicates_pages_and_uses_gold_page_intersection():
 
 
 def test_normal_recall_averages_only_rows_with_annotated_support_pages():
-    evaluator, _ = _recall_evaluator([[1, 3, 5], [0, 2, 4]])
+    evaluator, _ = _recall_evaluator(
+        [[1, 3, 5, 6, 7], [0, 2, 4, 6, 7]]
+    )
     result = evaluator.evaluate(
         questions=["unsupported", "supported"],
         gold_answers=[["answer"], ["answer"]],

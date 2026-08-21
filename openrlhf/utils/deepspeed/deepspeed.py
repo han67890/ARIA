@@ -160,38 +160,6 @@ class DeepspeedStrategy(ABC):
             model = model.model
         model.backward(loss)
 
-    def scale_loss_to_global_token_mean(
-        self,
-        local_mean_loss: torch.Tensor,
-        local_target_count: torch.Tensor,
-    ) -> torch.Tensor:
-        """Scale a local token mean for DeepSpeed's DP gradient averaging.
-
-        DeepSpeed averages gradients across the data-parallel group. Multiplying
-        rank ``r`` by ``D * n_r / sum_j n_j`` therefore makes the averaged
-        gradient equal to the physical global-minibatch token mean. TP and SP
-        peers are deliberately excluded from both ``D`` and the count sum.
-        """
-        if local_mean_loss.numel() != 1 or local_target_count.numel() != 1:
-            raise ValueError("likelihood loss and target-token count must be scalars")
-        if local_target_count.dtype == torch.bool or torch.is_floating_point(
-            local_target_count
-        ):
-            raise ValueError("target-token count must use an integer dtype")
-        dp_group = self.ds_device_mesh["dp"].get_group()
-        dp_world_size = dist.get_world_size(group=dp_group)
-        global_target_count = local_target_count.detach().clone().to(
-            device=local_mean_loss.device, dtype=torch.float32
-        )
-        dist.all_reduce(global_target_count, op=dist.ReduceOp.SUM, group=dp_group)
-        if not torch.isfinite(global_target_count) or global_target_count <= 0:
-            raise ValueError("global target-token count must be positive and finite")
-        local_count = local_target_count.detach().to(
-            device=local_mean_loss.device, dtype=torch.float32
-        )
-        scale = dp_world_size * local_count / global_target_count
-        return local_mean_loss * scale.to(local_mean_loss.dtype)
-
     def optimizer_step(
         self,
         optimizer: optim.Optimizer,
