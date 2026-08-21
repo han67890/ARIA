@@ -22,9 +22,10 @@ changes final order, not membership.
 ### QCA and AHR
 
 QCA evaluates 38 weighted surface rules. A query is Multi-Hop only when a hop
-rule fires and at least two named entities are present. When hop and aspect
-rules both fire, Multi-Hop takes precedence; otherwise an aspect match yields
-Multi-Aspect and the remaining queries are Simple.
+rule fires and at least two named entities are present. A query is Multi-Aspect
+only when an aspect rule fires and no hop rule fires. Thus, a hop match with
+fewer than two entities is Simple even if an aspect rule also fires; all other
+queries are Simple as well.
 
 QCA confidence is the matched-rule weight divided by total rule weight. AHR
 uses type-conditioned `(BM25, dense)` endpoints:
@@ -108,7 +109,10 @@ two terms.
 ARIA-NoComp is a fixed-checkpoint evaluation diagnostic. It runs the five
 retrieval stages once and concatenates the fixed top-five raw passages into the
 frozen Phase-II decoder context. Compression, CFRS, ACR, MTFRL, and the second
-retrieval round are bypassed, with no additional fine-tuning.
+retrieval round are bypassed, with no additional fine-tuning. The direct prompt
+uses a 32,768-token ceiling with a 64-token generation reserve; overflow is
+removed only from the evidence tail, preserving the standard system text and
+question.
 
 ## Implementation conventions for unspecified edges
 
@@ -126,5 +130,5 @@ normal five-document paper path:
 - Hard final CFRS sorting uses an identity-valued permutation surrogate. It
   keeps the submitted hard order in the forward pass and carries the
   appendix's CFRS score derivative.
-- ARIA-NoComp uses deterministic raw-passage concatenation. The submission's
-  32k-window observation is retained as the reported capacity context.
+- ARIA-NoComp uses deterministic raw-passage concatenation with two-newline
+  separators and question-preserving evidence-tail truncation.

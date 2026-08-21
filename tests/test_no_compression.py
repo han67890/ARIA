@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from openrlhf.models.modeling_aria import (
@@ -141,6 +142,58 @@ def test_no_compression_generator_preserves_raw_order_and_uses_token_ids():
     assert model.decoder.generate_kwargs["max_new_tokens"] == 64
     # Only newly generated IDs are decoded; prompt IDs never leak into answers.
     assert model.decoder_tokenizer.decoded_ids.tolist() == [[91, 2]]
+
+
+def test_no_compression_truncates_only_evidence_tail_and_keeps_question():
+    model = _direct_model(context_limit=128)
+    model._blend_standard_prompt = (
+        lambda context, question, answer: (
+            f"SYSTEM_KEEP Background: {context} Question: {question} ANSWER_ONLY"
+        )
+    )
+    documents = _documents()
+    documents[0].text = " ".join(f"evidence-{index}" for index in range(33_000))
+
+    decoded, prompt_lengths, document_tokens, context_limit = (
+        model._generate_no_compression_context(
+            ["QUESTION_KEEP"],
+            [documents],
+            ARIA_NO_COMPRESSION_MAX_NEW_TOKENS,
+        )
+    )
+
+    prompt = model.decoder_tokenizer.calls[-1][0]
+    assert decoded == ["answer"]
+    assert "SYSTEM_KEEP" in prompt
+    assert "Question: QUESTION_KEEP ANSWER_ONLY" in prompt
+    assert "evidence-32999" not in prompt
+    assert prompt_lengths.tolist() == [context_limit - 64]
+    assert document_tokens.item() < 33_008
+
+
+def test_no_compression_fails_if_fixed_prompt_cannot_fit_reserved_budget():
+    model = _direct_model(context_limit=128)
+    fixed = " ".join(["fixed"] * 32_705)
+    model._blend_standard_prompt = (
+        lambda context, question, answer: f"{fixed} Question: {question}"
+    )
+
+    with pytest.raises(ValueError, match="system/question prompt cannot fit"):
+        model._generate_no_compression_context(
+            ["QUESTION_KEEP"],
+            [_documents()],
+            ARIA_NO_COMPRESSION_MAX_NEW_TOKENS,
+        )
+
+
+def test_no_compression_requires_the_fixed_generation_reserve():
+    model = _direct_model(context_limit=128)
+    with pytest.raises(ValueError, match="fixed 64-token generation reserve"):
+        model._generate_no_compression_context(
+            ["QUESTION_KEEP"],
+            [_documents()],
+            32,
+        )
 
 
 def test_no_compression_full_path_returns_first_pass_and_skips_compressor():

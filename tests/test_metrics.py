@@ -12,22 +12,229 @@ from openrlhf.cli.evaluate_aria import (
     ARIAEvaluator,
     QAMetrics,
     _extract_gold_document_ids,
+    _extract_gold_answer,
+    _map_clara_candidates_to_corpus,
+    _load_oracle_qca_labels,
+    _parse_qca_llm_output,
+    _qca_llm_prompt,
+    _qca_weighted_f1,
+    _run_qca_llm_router,
     _merge_repository_candidates,
+    _oracle_qca_labeled_subset,
     _repository_candidate_identity,
     _repository_top5_documents,
     _load_repository_eval_rows,
     _validate_clara_archive_dir,
-    _validate_paper_answer_alias_contract,
+    _validate_oracle_qca_conditions,
+    _validate_oracle_qca_paper_panel,
+    _validate_paper_answer_contract,
+    _validate_qca_llm_conditions,
     aggregate_checkpoint_results,
     compare_evaluation_payloads,
     load_eval_dataset,
 )
+from openrlhf.cli.evaluate_aria import (
+    PAPER_QCA_LLM_MODEL,
+    QCA_LLM_MAX_NEW_TOKENS,
+    QCA_LLM_PROMPT_SHA256,
+    QCA_LLM_PROMPT_VERSION,
+    QCA_LLM_PROTOCOL,
+)
 from openrlhf.models.modeling_aria import RAGPipelineConfig
-from openrlhf.models.modeling_aria import ORACLE_TOP100_PROTOCOL
+from openrlhf.models.modeling_aria import (
+    ORACLE_TOP100_PROTOCOL,
+    _construct_oracle_top100_indices,
+)
 
 
 def test_appendix_a35_normalization_keeps_apostrophe_and_hyphen():
     assert QAMetrics.normalize_answer(" The O'Neill-style, Answer! ") == "o'neill-style answer"
+
+
+def test_qca_llm_prompt_parser_and_weighted_f1_contract():
+    prompt = _qca_llm_prompt("Which city is older?")
+    assert "simple" in prompt and "multi-aspect" in prompt and "multi-hop" in prompt
+    assert "Question: Which city is older?" in prompt
+    parsed, rationale = _parse_qca_llm_output(
+        "Label: multi-hop\nRationale: Two facts must be connected."
+    )
+    assert parsed == "multi_hop"
+    assert rationale == "Two facts must be connected."
+    with pytest.raises(ValueError, match="first line"):
+        _parse_qca_llm_output("The label is simple.\nRationale: direct")
+    with pytest.raises(ValueError, match="second line"):
+        _parse_qca_llm_output("Label: simple")
+    assert _qca_weighted_f1(
+        ["simple", "multi_aspect", "multi_hop"],
+        ["simple", "multi_aspect", "multi_hop"],
+    ) == pytest.approx(1.0)
+
+
+def test_qca_llm_endpoint_is_fail_closed_to_paper_setting():
+    _validate_qca_llm_conditions(
+        retrieval_mode="normal",
+        rag_configuration="full",
+        compression_rate=16,
+        dataset="all",
+        max_samples=None,
+    )
+    with pytest.raises(ValueError, match="dataset all"):
+        _validate_qca_llm_conditions(
+            retrieval_mode="normal",
+            rag_configuration="full",
+            compression_rate=16,
+            dataset="nq",
+            max_samples=None,
+        )
+
+
+class _QCALLMTokenizer:
+    eos_token_id = 2
+    pad_token_id = 0
+
+    def __call__(
+        self,
+        prompts,
+        *,
+        return_tensors,
+        padding,
+        add_special_tokens,
+        truncation,
+    ):
+        assert return_tensors == "pt"
+        assert padding == "longest"
+        assert add_special_tokens is False
+        assert truncation is False
+        width = max(len(prompt.split()) for prompt in prompts)
+        return {
+            "input_ids": torch.ones((len(prompts), width), dtype=torch.long),
+            "attention_mask": torch.ones((len(prompts), width), dtype=torch.long),
+        }
+
+    @staticmethod
+    def batch_decode(ids, skip_special_tokens):
+        assert skip_special_tokens is True
+        return [
+            "Label: simple\nRationale: One direct fact is requested."
+            for _ in range(ids.size(0))
+        ]
+
+
+class _QCALLMDecoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.config = SimpleNamespace(max_position_embeddings=32_768)
+        self.adapters_disabled = False
+        self.generate_kwargs = None
+
+    class _DisableContext:
+        def __init__(self, decoder):
+            self.decoder = decoder
+
+        def __enter__(self):
+            self.decoder.adapters_disabled = True
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.decoder.adapters_disabled = False
+
+    def disable_adapter(self):
+        return self._DisableContext(self)
+
+    def generate(self, **kwargs):
+        assert self.adapters_disabled is True
+        self.generate_kwargs = kwargs
+        suffix = torch.ones((kwargs["input_ids"].size(0), 2), dtype=torch.long)
+        return torch.cat((kwargs["input_ids"], suffix), dim=1)
+
+
+def test_qca_llm_router_uses_adapter_free_greedy_decoding_and_records_prompt():
+    decoder = _QCALLMDecoder()
+    model = SimpleNamespace(
+        decoder_model_name=PAPER_QCA_LLM_MODEL,
+        config=SimpleNamespace(decoder_model_resolved_revision="a" * 40),
+        decoder=decoder,
+        decoder_tokenizer=_QCALLMTokenizer(),
+    )
+    records = _run_qca_llm_router(model, ["Who wrote it?"], batch_size=1)
+    assert records[0]["protocol"] == QCA_LLM_PROTOCOL
+    assert records[0]["prompt_version"] == QCA_LLM_PROMPT_VERSION
+    assert records[0]["prompt_template_sha256"] == QCA_LLM_PROMPT_SHA256
+    assert records[0]["parsed_type"] == "simple"
+    assert records[0]["adapters_disabled"] is True
+    assert decoder.adapters_disabled is False
+    assert decoder.generate_kwargs["do_sample"] is False
+    assert decoder.generate_kwargs["num_beams"] == 1
+    assert decoder.generate_kwargs["max_new_tokens"] == QCA_LLM_MAX_NEW_TOKENS
+
+
+def test_oracle_qca_label_artifacts_are_keyed_and_subset_by_example_id(tmp_path):
+    json_path = tmp_path / "labels.json"
+    json_path.write_text(
+        json.dumps({"q-2": "multi_hop", "q-4": "multi_aspect"}),
+        encoding="utf-8",
+    )
+    labels = _load_oracle_qca_labels(str(json_path))
+    indices, reference_types = _oracle_qca_labeled_subset(
+        ["q-1", "q-2", "q-3", "q-4"],
+        labels,
+        dataset_name="nq",
+    )
+
+    assert indices == [1, 3]
+    assert reference_types == ["multi_hop", "multi_aspect"]
+
+    jsonl_path = tmp_path / "labels.jsonl"
+    jsonl_path.write_text(
+        '{"example_id":"q-1","question_type":"simple"}\n'
+        '{"example_id":"q-3","question_type":"multi_hop"}\n',
+        encoding="utf-8",
+    )
+    assert _load_oracle_qca_labels(str(jsonl_path)) == {
+        "q-1": "simple",
+        "q-3": "multi_hop",
+    }
+
+
+@pytest.mark.parametrize(
+    "retrieval_mode,rag_configuration,compression_rate,match",
+    [
+        ("oracle", "full", 16, "retrieval_mode normal"),
+        ("normal", "remove_qca", 16, "rag_configuration full"),
+        ("normal", "full", 32, "compression_rate 16"),
+    ],
+)
+def test_oracle_qca_conditions_fail_closed(
+    retrieval_mode, rag_configuration, compression_rate, match
+):
+    with pytest.raises(ValueError, match=match):
+        _validate_oracle_qca_conditions(
+            retrieval_mode=retrieval_mode,
+            rag_configuration=rag_configuration,
+            compression_rate=compression_rate,
+        )
+    with pytest.raises(ValueError, match="cannot be combined with --max_samples"):
+        _validate_oracle_qca_conditions(
+            retrieval_mode="normal",
+            rag_configuration="full",
+            compression_rate=16,
+            max_samples=1000,
+        )
+    with pytest.raises(ValueError, match="requires --dataset all"):
+        _validate_oracle_qca_conditions(
+            retrieval_mode="normal",
+            rag_configuration="full",
+            compression_rate=16,
+            dataset="nq",
+        )
+
+
+def test_oracle_qca_cli_panel_requires_the_paper_benchmark_counts():
+    _validate_oracle_qca_paper_panel("musique", [f"q-{index}" for index in range(84)])
+    with pytest.raises(ValueError, match="exactly 84 labeled musique"):
+        _validate_oracle_qca_paper_panel(
+            "musique", [f"q-{index}" for index in range(83)]
+        )
 
 
 def test_multi_gold_uses_best_match():
@@ -37,30 +244,21 @@ def test_multi_gold_uses_best_match():
     assert QAMetrics.f1_score("Ada Lovelace", gold) == 1.0
 
 
-def test_paper_answer_contract_rejects_external_scalar_only_rows():
-    with pytest.raises(ValueError, match=r"external \*_no_pos"):
-        _validate_paper_answer_alias_contract(
-            [{"question": "Who?", "answer": "Ada Lovelace"}],
-            dataset_name="nq",
-            answer_key="answer",
-        )
+def test_paper_answer_contract_accepts_one_scalar_reference():
+    rows = [{"question": "Who?", "answer": "Ada Lovelace"}]
+    _validate_paper_answer_contract(rows, dataset_name="nq", answer_key="answer")
+    assert _extract_gold_answer(rows[0], "answer") == "Ada Lovelace"
 
 
-def test_paper_dataset_loader_requires_explicit_alias_artifact():
+def test_paper_dataset_loader_requires_prepared_artifact():
     with pytest.raises(ValueError, match="require --eval_data_path"):
         load_eval_dataset("nq")
 
 
-def test_paper_answer_contract_requires_aliases_to_include_primary_answer():
-    with pytest.raises(ValueError, match="include every benchmark-provided primary"):
-        _validate_paper_answer_alias_contract(
-            [
-                {
-                    "question": "Who?",
-                    "answer": "Ada Lovelace",
-                    "gold_answers": ["Augusta Ada King"],
-                }
-            ],
+def test_paper_answer_contract_rejects_multi_answer_containers():
+    with pytest.raises(ValueError, match="non-empty scalar"):
+        _validate_paper_answer_contract(
+            [{"question": "Who?", "answer": ["Ada", "Lovelace"]}],
             dataset_name="nq",
             answer_key="answer",
         )
@@ -71,16 +269,12 @@ def test_clara_candidates_merge_only_on_exact_question_alignment():
         {
             "question": "Who?",
             "answer": "Ada Lovelace",
-            "gold_answers": ["Ada Lovelace", "Augusta Ada King"],
         }
     ]
     archived = [
         {
             "question": "Who?",
             "docs": ["candidate"],
-            "clara_candidate_doc_ids": ["doc-1"],
-            "clara_candidate_page_ids": ["page-1"],
-            "clara_gold_candidate_indices": [0],
         }
     ]
     merged = _merge_repository_candidates(
@@ -89,7 +283,7 @@ def test_clara_candidates_merge_only_on_exact_question_alignment():
         dataset_name="nq",
         question_key="question",
     )
-    assert merged[0]["gold_answers"] == ["Ada Lovelace", "Augusta Ada King"]
+    assert merged[0]["answer"] == "Ada Lovelace"
     assert merged[0]["docs"] == ["candidate"]
 
     archived[0]["question"] = "A different question"
@@ -259,23 +453,25 @@ class _ClaraRecallModel:
         return ["answer" for _ in questions], indices
 
 
-def test_clara_archive_recall_uses_hard_selector_pages_and_q_sup():
+def test_clara_recall_uses_full_corpus_gold_pages_and_q_sup():
     documents = [[f"document {index}" for index in range(20)]]
     doc_ids = [[f"doc-{index}" for index in range(20)]]
     page_ids = [[f"page-{index}" for index in range(20)]]
     evaluator = ARIAEvaluator(
         model=_ClaraRecallModel(),
-        corpus_docs=[],
+        corpus_docs=documents[0],
+        corpus_ids=doc_ids[0],
+        corpus_page_ids=page_ids[0],
         use_rag_pipeline=False,
     )
 
     result = evaluator.evaluate(
         questions=["question"],
-        gold_answers=[["answer"]],
+        gold_answers=["answer"],
+        gold_doc_ids=[["doc-0", "doc-1"]],
         documents=documents,
         clara_candidate_doc_ids=doc_ids,
         clara_candidate_page_ids=page_ids,
-        clara_gold_candidate_indices=[[0, 1]],
         batch_size=1,
     )
 
@@ -283,7 +479,9 @@ def test_clara_archive_recall_uses_hard_selector_pages_and_q_sup():
     assert result["recall_at_5_support_count"] == 1
     assert result["clara_retrieval_provenance"]["candidate_count"] == 20
     assert result["clara_retrieval_provenance"]["hard_selection_count"] == 5
-    assert result["clara_retrieval_provenance"]["release_convention"] is True
+    assert result["clara_retrieval_provenance"]["support_scope"] == (
+        "prepared-full-corpus-Q_sup"
+    )
     assert result["predictions"][0]["retrieved_doc_ids"] == [
         "doc-2",
         "doc-1",
@@ -293,15 +491,75 @@ def test_clara_archive_recall_uses_hard_selector_pages_and_q_sup():
     ]
 
 
+def test_clara_archive_candidates_require_a_unique_exact_corpus_mapping():
+    documents = [["This is a document about Ada\npassage"]]
+    mapped_doc_ids, mapped_page_ids, mapped_indices = _map_clara_candidates_to_corpus(
+        documents,
+        corpus_docs=[documents[0][0]],
+        corpus_ids=["doc-ada"],
+        corpus_page_ids=["https://en.wikipedia.org/wiki/Ada"],
+    )
+    assert mapped_doc_ids == [["doc-ada"]]
+    assert mapped_page_ids == [["https://en.wikipedia.org/wiki/Ada"]]
+    assert mapped_indices == [[0]]
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        _map_clara_candidates_to_corpus(
+            documents,
+            corpus_docs=[documents[0][0], documents[0][0]],
+            corpus_ids=["doc-a", "doc-b"],
+            corpus_page_ids=["page-a", "page-b"],
+        )
+
+
+def test_clara_oracle_selects_hard_top5_from_the_shared_top100_pool():
+    corpus_docs = [f"document {index}" for index in range(105)]
+    corpus_ids = [f"doc-{index}" for index in range(105)]
+    corpus_pages = [f"page-{index}" for index in range(105)]
+    pool_record = _construct_oracle_top100_indices(
+        list(range(100)),
+        [2, 101],
+        corpus_page_ids=corpus_pages,
+    )
+    evaluator = ARIAEvaluator(
+        model=_ClaraRecallModel(),
+        corpus_docs=corpus_docs,
+        corpus_ids=corpus_ids,
+        corpus_page_ids=corpus_pages,
+        doc_embeddings=torch.randn(105, 1024),
+        use_rag_pipeline=False,
+        retrieval_mode="oracle",
+    )
+    result = evaluator.evaluate(
+        questions=["question"],
+        gold_answers=["answer"],
+        gold_doc_ids=[["doc-2", "doc-101"]],
+        oracle_pool_records=[pool_record],
+        batch_size=1,
+    )
+
+    prediction = result["predictions"][0]
+    assert result["clara_retrieval_provenance"]["candidate_count"] == 100
+    assert len(prediction["oracle_pool_doc_ids"]) == 100
+    assert prediction["oracle_pool_sha256"] == pool_record.pool_sha256
+    assert prediction["retrieved_doc_ids"] == [
+        corpus_ids[pool_record.pool_indices[index]] for index in [2, 1, 5, 6, 7]
+    ]
+    assert prediction["recall_at_5"] == pytest.approx(0.5)
+
+
 class _RecallModel:
     compr_rate = 16
+    config = SimpleNamespace(aria_rag_configuration="full")
 
     def __init__(self, index_rows):
         self._bge_projection = torch.nn.Linear(3, 3, bias=False)
+        self._mtfrl_projection = torch.nn.Linear(3, 3, bias=False)
         self._index_rows = torch.tensor(index_rows, dtype=torch.long)
         self._diagnostics = []
         self.returned_first_pass = None
         self.oracle_gold_indices = None
+        self.qca_reference_types = None
         self._oracle_records = []
 
     def setup_rag_pipeline(self, **kwargs):
@@ -324,12 +582,29 @@ class _RecallModel:
         max_new_tokens,
         return_first_pass_indices,
         oracle_gold_indices=None,
+        oracle_pool_records=None,
+        qca_reference_types=None,
     ):
         del documents, max_new_tokens
         self.returned_first_pass = return_first_pass_indices
         self.oracle_gold_indices = oracle_gold_indices
-        self._diagnostics = [object() for _ in questions]
-        if oracle_gold_indices is not None:
+        self.qca_reference_types = qca_reference_types
+        if qca_reference_types is None:
+            self._diagnostics = [object() for _ in questions]
+        else:
+            self._diagnostics = [
+                SimpleNamespace(
+                    rule_question_type="simple",
+                    oracle_question_type=question_type,
+                    evidence_memory_tokens=1,
+                    final_candidates=5,
+                    second_round_candidates=200,
+                )
+                for question_type in qca_reference_types
+            ]
+        if oracle_pool_records is not None:
+            self._oracle_records.extend(oracle_pool_records)
+        elif oracle_gold_indices is not None:
             for row in oracle_gold_indices:
                 injected = tuple(index for index in row if index >= 100)
                 retained = tuple(range(100 - len(injected)))
@@ -375,13 +650,39 @@ def test_evaluator_uses_the_shared_bge_document_index_for_mads():
     }
 
 
+def test_evaluator_applies_and_records_oracle_qca_label_only_override():
+    model = _RecallModel([[0, 1, 2, 3, 4]])
+    evaluator = ARIAEvaluator(
+        model=model,
+        corpus_docs=[f"document {index}" for index in range(8)],
+        corpus_ids=[f"doc-{index}" for index in range(8)],
+        corpus_page_ids=[f"page-{index}" for index in range(8)],
+        doc_embeddings=torch.randn(8, 3),
+        rag_config=RAGPipelineConfig(compression_rate=16),
+    )
+
+    result = evaluator.evaluate(
+        questions=["question"],
+        gold_answers=["answer"],
+        example_ids=["q-1"],
+        qca_reference_types=["multi_hop"],
+        batch_size=1,
+    )
+
+    assert model.qca_reference_types == ["multi_hop"]
+    prediction = result["predictions"][0]
+    assert prediction["qca_rule_type"] == "simple"
+    assert prediction["qca_oracle_type"] == "multi_hop"
+    assert result["oracle_qca_provenance"]["labeled_example_count"] == 1
+
+
 def test_recall_at_5_maps_first_pass_indices_to_stable_corpus_ids():
     evaluator, model = _recall_evaluator(
         [[1, 3, 5, 6, 7], [0, 2, 4, 6, 7]]
     )
     result = evaluator.evaluate(
         questions=["q1", "q2"],
-        gold_answers=[["answer"], ["answer"]],
+        gold_answers=["answer", "answer"],
         gold_doc_ids=[["doc-1", "doc-2"], ["doc-0", "doc-2", "doc-3"]],
         batch_size=2,
     )
@@ -410,7 +711,7 @@ def test_recall_at_5_rejects_ccef_survivor_sets_smaller_than_five():
     with pytest.raises(RuntimeError, match="exactly five survivors"):
         evaluator.evaluate(
             questions=["q"],
-            gold_answers=[["answer"]],
+            gold_answers=["answer"],
             gold_doc_ids=[["doc-1", "doc-2"]],
             batch_size=1,
         )
@@ -421,7 +722,7 @@ def test_recall_at_5_rejects_padded_variable_survivors():
     with pytest.raises(RuntimeError, match="exactly five survivors"):
         evaluator.evaluate(
             questions=["q"],
-            gold_answers=[["answer"]],
+            gold_answers=["answer"],
             gold_doc_ids=[["doc-1"]],
             batch_size=1,
         )
@@ -432,7 +733,7 @@ def test_recall_at_5_deduplicates_pages_and_uses_gold_page_intersection():
     evaluator, _ = _recall_evaluator([[1, 3, 2, 4, 5]], page_ids=page_ids)
     result = evaluator.evaluate(
         questions=["q"],
-        gold_answers=[["answer"]],
+        gold_answers=["answer"],
         gold_doc_ids=[["doc-3", "doc-6"]],
         batch_size=1,
     )
@@ -450,7 +751,7 @@ def test_normal_recall_averages_only_rows_with_annotated_support_pages():
     )
     result = evaluator.evaluate(
         questions=["unsupported", "supported"],
-        gold_answers=[["answer"], ["answer"]],
+        gold_answers=["answer", "answer"],
         gold_doc_ids=[[], ["doc-2"]],
         batch_size=2,
     )
@@ -464,7 +765,7 @@ def test_normal_recall_averages_only_rows_with_annotated_support_pages():
 def test_unannotated_evaluation_does_not_fabricate_retrieval_metrics():
     evaluator, model = _recall_evaluator([[1, 3, 5, 6, 7]])
     result = evaluator.evaluate(
-        questions=["q1"], gold_answers=[["answer"]], batch_size=1
+        questions=["q1"], gold_answers=["answer"], batch_size=1
     )
 
     assert model.returned_first_pass is False
@@ -479,27 +780,32 @@ def test_evaluator_enforces_the_paper_generation_length():
     with pytest.raises(ValueError, match="max_new_tokens=64"):
         evaluator.evaluate(
             questions=["q"],
-            gold_answers=[["answer"]],
+            gold_answers=["answer"],
             max_new_tokens=65,
         )
 
 
 def test_oracle_evaluation_uses_final_top5_and_materializes_fixed_pool():
     corpus_ids = [f"doc-{index}" for index in range(105)]
+    corpus_pages = [f"page-{index}" for index in range(105)]
+    shared_pool = _construct_oracle_top100_indices(
+        list(range(100)), [2, 101], corpus_page_ids=corpus_pages
+    )
     model = _RecallModel([[0, 1, 2, 3, 4]])
     evaluator = ARIAEvaluator(
         model=model,
         corpus_docs=[f"document {index}" for index in range(105)],
         corpus_ids=corpus_ids,
-        corpus_page_ids=[f"page-{index}" for index in range(105)],
+        corpus_page_ids=corpus_pages,
         doc_embeddings=torch.randn(105, 3),
         rag_config=RAGPipelineConfig(use_mtfrl=False),
         retrieval_mode="oracle",
     )
     result = evaluator.evaluate(
         questions=["q"],
-        gold_answers=[["answer"]],
+        gold_answers=["answer"],
         gold_doc_ids=[["doc-2", "doc-101"]],
+        oracle_pool_records=[shared_pool],
         batch_size=1,
     )
 
@@ -508,6 +814,7 @@ def test_oracle_evaluation_uses_final_top5_and_materializes_fixed_pool():
     prediction = result["predictions"][0]
     assert len(prediction["oracle_pool_doc_ids"]) == 100
     assert prediction["oracle_pool_doc_ids"][0] == "doc-0"
+    assert prediction["oracle_pool_sha256"] == shared_pool.pool_sha256
     assert prediction["oracle_injected_gold_doc_ids"] == ["doc-101"]
     assert prediction["recall_at_1"] == pytest.approx(0.0)
     assert prediction["recall_at_3"] == pytest.approx(0.5)
@@ -530,7 +837,7 @@ def test_oracle_evaluation_rejects_missing_corpus_level_labels():
         retrieval_mode="oracle",
     )
     with pytest.raises(ValueError, match="requires corpus-level gold_doc_ids"):
-        evaluator.evaluate(questions=["q"], gold_answers=[["answer"]])
+        evaluator.evaluate(questions=["q"], gold_answers=["answer"])
 
 
 def test_oracle_evaluation_rejects_rows_without_a_support_page():
@@ -547,7 +854,7 @@ def test_oracle_evaluation_rejects_rows_without_a_support_page():
     )
     with pytest.raises(ValueError, match="must contain at least one support"):
         evaluator.evaluate(
-            questions=["q"], gold_answers=[["answer"]], gold_doc_ids=[[]]
+            questions=["q"], gold_answers=["answer"], gold_doc_ids=[[]]
         )
 
 
@@ -576,7 +883,7 @@ def _comparison_payload(benchmark_scores):
                     {
                         "example_id": f"{benchmark}-{index}",
                         "question": f"Question {benchmark} {index}?",
-                        "gold_answers": [f"answer-{index}"],
+                        "gold_answer": f"answer-{index}",
                         "em": score,
                         "cem": score,
                         "f1": score,

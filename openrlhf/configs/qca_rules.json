@@ -3,13 +3,14 @@
   "entity_types": ["PERSON", "ORG", "GPE", "LOC", "FAC", "EVENT", "PRODUCT", "WORK_OF_ART"],
   "classification": {
     "multi_hop": "any hop indicator with at least two named entities",
-    "multi_aspect": "any aspect indicator when the guarded multi-hop route does not fire",
+    "multi_aspect": "any aspect indicator when no hop indicator fires",
     "simple": "otherwise",
     "multi_hop_min_entities": 2,
+    "multi_aspect_requires_no_hop": true,
     "hop_precedes_aspect": true,
     "conflict_precedence": [
       "multi_hop_with_two_entities",
-      "multi_aspect",
+      "multi_aspect_without_any_hop",
       "simple"
     ]
   },

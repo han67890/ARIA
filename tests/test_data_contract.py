@@ -1,13 +1,23 @@
 import hashlib
+import json
 import zipfile
+from dataclasses import asdict
 
 import pytest
+from datasets import Dataset
 
+import openrlhf.cli.aria_data as aria_data_module
 from openrlhf.cli.aria_data import (
     EVALUATION_COUNTS,
+    MUSIQUE_AUGMENTATION_COUNTS,
+    MUSIQUE_DERIVED_MANIFEST_PROTOCOL,
+    PAPER_PHASE2_EPOCH_SEEDS,
     PHASE1_TOTAL,
     PHASE2_SAMPLES_PER_EPOCH,
     Phase2FieldMap,
+    _validate_musique_derived_manifest,
+    _validate_phase2_epoch_seeds,
+    build_parser,
     _normalize_phase2_row,
     canonicalize_page_url,
 )
@@ -22,9 +32,6 @@ from openrlhf.utils.aria_provenance import (
 )
 from openrlhf.utils.musique_augmentation import (
     MUSIQUE_PARTIAL_CHAIN_PROTOCOL,
-    MUSIQUE_PARTIAL_CHAIN_TARGET,
-    MUSIQUE_ORIGINAL_COUNT,
-    MUSIQUE_SUBQUESTION_COUNT,
     build_musique_partial_rows,
     validate_musique_partial_metadata,
 )
@@ -39,8 +46,27 @@ def test_paper_counts_are_fixed():
         "musique": 2_417,
         "2wikimultihopqa": 12_576,
     }
-    assert MUSIQUE_PARTIAL_CHAIN_TARGET == 70_845
-    assert MUSIQUE_SUBQUESTION_COUNT - MUSIQUE_ORIGINAL_COUNT == 32_169
+    assert MUSIQUE_AUGMENTATION_COUNTS == {
+        "original": 19_938,
+        "subquestion": 52_107,
+        "partial_chain": 70_845,
+        "entity_variant": 25_855,
+    }
+    assert PAPER_PHASE2_EPOCH_SEEDS == (42, 123, 456, 789, 2024)
+
+
+def test_phase2_epoch_seed_schedule_is_the_fixed_paper_protocol():
+    assert _validate_phase2_epoch_seeds([42, 123, 456, 789, 2024]) == (
+        42,
+        123,
+        456,
+        789,
+        2024,
+    )
+    with pytest.raises(ValueError, match="requires epoch seed schedule"):
+        _validate_phase2_epoch_seeds([1, 2, 3, 4, 5])
+    args = build_parser().parse_args(["--stage", "phase2"])
+    assert tuple(args.epoch_seeds) == PAPER_PHASE2_EPOCH_SEEDS
 
 
 def _musique_parent(parent_id, hop_count):
@@ -60,14 +86,14 @@ def _musique_parent(parent_id, hop_count):
     }
 
 
-def test_musique_partial_states_are_exact_unique_balanced_and_order_independent():
+def test_generic_musique_prefix_utility_is_unique_balanced_and_order_independent():
     parents = [
         _musique_parent("two", 2),
         _musique_parent("three", 3),
         _musique_parent("four", 4),
     ]
     kwargs = dict(
-        target_count=20,
+        target_count=14,
         expected_original_count=None,
         expected_subquestion_count=None,
     )
@@ -77,7 +103,7 @@ def test_musique_partial_states_are_exact_unique_balanced_and_order_independent(
     )
 
     ids = [row["partial_state_id"] for row in rows]
-    assert len(ids) == len(set(ids)) == 20
+    assert len(ids) == len(set(ids)) == 14
     assert ids == [row["partial_state_id"] for row in reversed_rows]
     assert manifest["selected_state_ids_sha256"] == reversed_manifest[
         "selected_state_ids_sha256"
@@ -86,6 +112,17 @@ def test_musique_partial_states_are_exact_unique_balanced_and_order_independent(
     assert manifest["mandatory_prefix_count"] == 6
     assert sum(row["partial_mandatory_prefix"] for row in rows) == 6
     assert all(row["needs_candidate_retrieval"] is True for row in rows)
+    assert all(
+        row["partial_known_hop_indices"]
+        == list(range(len(row["partial_known_hop_indices"])))
+        for row in rows
+    )
+    assert all(
+        row["partial_frontier_hop_index"] == -1
+        or row["partial_frontier_hop_index"]
+        >= len(row["partial_known_hop_indices"])
+        for row in rows
+    )
     # The final-hop answer is a training target only, never part of the prompt.
     assert all("FINAL_SECRET" not in row["question"] for row in rows)
 
@@ -95,7 +132,7 @@ def test_musique_partial_metadata_rejects_final_hop_as_known_evidence():
         "augmentation_parent_id": "p",
         "partial_state_protocol": MUSIQUE_PARTIAL_CHAIN_PROTOCOL,
         "partial_state_id": "musique-partial:" + "0" * 64,
-        "partial_state_kind": "evidence_subset",
+        "partial_state_kind": "evidence_prefix",
         "partial_hop_count": 3,
         "partial_known_hop_indices": [2],
         "partial_frontier_hop_index": -1,
@@ -104,7 +141,7 @@ def test_musique_partial_metadata_rejects_final_hop_as_known_evidence():
         validate_musique_partial_metadata(row)
 
 
-def test_musique_partial_row_requires_fresh_candidates_before_phase2():
+def test_historical_musique_partial_row_does_not_require_generated_state_metadata():
     rows, _ = build_musique_partial_rows(
         [_musique_parent("parent", 2)],
         target_count=1,
@@ -122,16 +159,6 @@ def test_musique_partial_row_requires_fresh_candidates_before_phase2():
         pos_index=[0],
         gold_doc_ids=["doc-0"],
     )
-    with pytest.raises(ValueError, match="fresh BGE top-5"):
-        _normalize_phase2_row(
-            row,
-            0,
-            benchmark="musique",
-            field_map=Phase2FieldMap(),
-            test_urls=set(),
-        )
-
-    row["needs_candidate_retrieval"] = False
     normalized = _normalize_phase2_row(
         row,
         0,
@@ -139,8 +166,119 @@ def test_musique_partial_row_requires_fresh_candidates_before_phase2():
         field_map=Phase2FieldMap(),
         test_urls=set(),
     )
-    assert normalized["partial_state_id"] == row["partial_state_id"]
-    assert normalized["partial_state_protocol"] == MUSIQUE_PARTIAL_CHAIN_PROTOCOL
+    assert normalized["augmentation_type"] == "partial_chain"
+    assert normalized["augmentation_parent_id"] == "parent"
+    assert normalized["construction_method"] == MUSIQUE_PARTIAL_CHAIN_PROTOCOL
+    assert "partial_state_id" not in normalized
+
+
+def test_historical_musique_source_requires_matching_external_content_manifest(
+    tmp_path, monkeypatch
+):
+    decomposition = [
+        {"question": "bridge?", "answer": "bridge-answer"},
+        {"question": "final?", "answer": "final-answer"},
+    ]
+    rows = [
+        {
+            "source_row_id": "p",
+            "augmentation_type": "original",
+            "augmentation_parent_id": "",
+            "question": "original?",
+            "answer": "final-answer",
+            "question_decomposition": decomposition,
+        },
+        {
+            "source_row_id": "s",
+            "augmentation_type": "subquestion",
+            "augmentation_parent_id": "p",
+            "question": "bridge?",
+            "answer": "bridge-answer",
+            "question_decomposition": decomposition,
+        },
+        {
+            "source_row_id": "c",
+            "augmentation_type": "partial_chain",
+            "augmentation_parent_id": "p",
+            "question": "partial?",
+            "answer": "final-answer",
+            "question_decomposition": decomposition,
+        },
+        {
+            "source_row_id": "e",
+            "augmentation_type": "entity_variant",
+            "augmentation_parent_id": "p",
+            "question": "variant?",
+            "answer": "final-answer",
+            "question_decomposition": decomposition,
+        },
+    ]
+    counts = {
+        "original": 1,
+        "subquestion": 1,
+        "partial_chain": 1,
+        "entity_variant": 1,
+    }
+    monkeypatch.setattr(aria_data_module, "MUSIQUE_AUGMENTATION_COUNTS", counts)
+    monkeypatch.setitem(aria_data_module.PHASE2_POOL_COUNTS, "musique", 4)
+
+    def canonical(value):
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    source_hasher = hashlib.sha256()
+    family_hashers = {family: hashlib.sha256() for family in counts}
+    parent_hasher = hashlib.sha256()
+    for row in rows:
+        encoded = canonical(row).encode("utf-8") + b"\n"
+        source_hasher.update(encoded)
+        family_hashers[row["augmentation_type"]].update(encoded)
+        parent_id = row.get("augmentation_parent_id", "")
+        parent_hasher.update(
+            canonical(
+                [
+                    row["augmentation_type"],
+                    row["source_row_id"],
+                    parent_id,
+                    row["answer"],
+                    row["question_decomposition"],
+                ]
+            ).encode("utf-8")
+        )
+        parent_hasher.update(b"\n")
+    dataset = Dataset.from_list(rows)
+    manifest = {
+        "protocol": MUSIQUE_DERIVED_MANIFEST_PROTOCOL,
+        "total_count": 4,
+        "family_counts": counts,
+        "source_columns": list(dataset.column_names),
+        "field_map": asdict(Phase2FieldMap()),
+        "source_content_sha256": source_hasher.hexdigest(),
+        "family_content_sha256": {
+            family: hasher.hexdigest()
+            for family, hasher in family_hashers.items()
+        },
+        "parent_link_sha256": parent_hasher.hexdigest(),
+    }
+    path = tmp_path / "musique-derived.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = _validate_musique_derived_manifest(
+        dataset, Phase2FieldMap(), str(path)
+    )
+    assert summary["source_content_sha256"] == source_hasher.hexdigest()
+    assert summary["family_counts"] == counts
+
+    changed_rows = [dict(row) for row in rows]
+    changed_rows[2]["answer"] = "changed"
+    with pytest.raises(ValueError, match="changes its parent answer"):
+        _validate_musique_derived_manifest(
+            Dataset.from_list(changed_rows), Phase2FieldMap(), str(path)
+        )
 
 
 def test_page_url_canonicalization():
@@ -191,7 +329,6 @@ def test_evaluation_preserves_gold_documents_beyond_existing_top5_candidates():
     row = {
         "question": "Which document is relevant?",
         "answer": "document six",
-        "gold_answers": ["document six", "the sixth document"],
         "source_row_id": "eval-1",
         "docs": [f"document {index}" for index in range(7)],
         "page_url": [
@@ -204,11 +341,11 @@ def test_evaluation_preserves_gold_documents_beyond_existing_top5_candidates():
         "gold_doc_ids": ["doc-6", "corpus-positive-not-in-candidates"],
     }
 
-    scalar_only = dict(row)
-    scalar_only.pop("gold_answers")
-    with pytest.raises(ValueError, match="benchmark-provided gold aliases"):
+    multi_answer = dict(row)
+    multi_answer["answer"] = ["document six", "the sixth document"]
+    with pytest.raises(ValueError, match="must be a non-empty string"):
         _normalize_phase2_row(
-            scalar_only,
+            multi_answer,
             0,
             benchmark="nq",
             field_map=Phase2FieldMap(),
@@ -233,10 +370,8 @@ def test_evaluation_preserves_gold_documents_beyond_existing_top5_candidates():
         "doc-6",
         "corpus-positive-not-in-candidates",
     ]
-    assert normalized["gold_answers"] == [
-        "document six",
-        "the sixth document",
-    ]
+    assert normalized["answer"] == "document six"
+    assert "gold_answers" not in normalized
 
 
 def test_candidate_preparation_keeps_first_occurrence_per_page_id():
@@ -251,7 +386,6 @@ def test_candidate_preparation_keeps_first_occurrence_per_page_id():
     row = {
         "question": "Which shared page is relevant?",
         "answer": "shared",
-        "gold_answers": ["shared"],
         "source_row_id": "page-dedup-1",
         "docs": [f"document {index}" for index in range(7)],
         "page_url": page_urls,

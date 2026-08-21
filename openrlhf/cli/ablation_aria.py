@@ -3,8 +3,8 @@
 
 Training-seed statistics are computed from distinct checkpoints. The five
 retrieval-stage ablations are fixed-checkpoint interventions and therefore use
-the aligned Full-ARIA checkpoint for each seed; matched retraining labels use
-their own independently trained checkpoint for each seed. One checkpoint is
+the aligned Full-ARIA checkpoint for each seed. Additional retrained release
+controls use their own independently trained checkpoint for each seed. One checkpoint is
 never re-run under several RNG seeds and presented as a multi-seed experiment.
 
 Example:
@@ -28,7 +28,7 @@ import torch
 
 from openrlhf.cli.evaluate_aria import (
     ARIAEvaluator,
-    EVALUATION_ANSWER_ALIAS_CONTRACT,
+    EVALUATION_ANSWER_CONTRACT,
     PAPER_COMPRESSION_RATES,
     PAPER_MAX_NEW_TOKENS,
     PAPER_TRAINING_SEEDS,
@@ -39,8 +39,10 @@ from openrlhf.cli.evaluate_aria import (
     _corpus_text,
     _extract_example_ids,
     _extract_clara_candidate_columns,
-    _extract_gold_answers,
+    _extract_gold_answer,
+    _extract_gold_document_ids,
     _format_artifact_path,
+    _map_clara_candidates_to_corpus,
     _required_checkpoint_configuration,
     _text_sha256,
     _assert_normal_retrieval_is_not_training_index,
@@ -211,19 +213,16 @@ def run_ablation(
         clara_archive_dir=clara_archive_dir,
     )
     questions = [item[question_key] for item in dataset]
-    gold_answers = [_extract_gold_answers(item, answer_key) for item in dataset]
+    gold_answers = [_extract_gold_answer(item, answer_key) for item in dataset]
+    gold_document_ids = _extract_gold_document_ids(dataset)
+    if gold_document_ids is None:
+        raise ValueError("Ablation evaluation requires prepared gold_doc_ids")
     example_ids = _extract_example_ids(dataset, dataset_name)
     baseline_documents: Optional[List[List[str]]] = None
     baseline_candidate_doc_ids: Optional[List[List[str]]] = None
     baseline_candidate_page_ids: Optional[List[List[str]]] = None
-    baseline_gold_candidate_indices: Optional[List[List[int]]] = None
     if ablation_name == "clara_baseline":
-        (
-            baseline_documents,
-            baseline_candidate_doc_ids,
-            baseline_candidate_page_ids,
-            baseline_gold_candidate_indices,
-        ) = _extract_clara_candidate_columns(dataset)
+        baseline_documents = _extract_clara_candidate_columns(dataset)
 
     rag_config = create_rag_config(ablation_name, compression_rate)
     corpus_docs: List[str] = []
@@ -232,56 +231,67 @@ def run_ablation(
     corpus_digest: Optional[str] = None
     doc_embeddings: Optional[torch.Tensor] = None
     bm25_index: Optional[_BM25Index] = None
-    if ablation_name != "clara_baseline":
-        if corpus_path is None or doc_embeddings_path is None:
-            raise ValueError("ARIA ablations require corpus_path and doc_embeddings_path")
-        checkpoint_config = CLaRaConfig.from_pretrained(seed_checkpoints[0][1])
-        training_index_sha256 = getattr(
-            checkpoint_config, "aria_training_retrieval_index_sha256", None
-        )
-        if not isinstance(training_index_sha256, str) or len(training_index_sha256) != 64:
-            raise ValueError("Checkpoint lacks its Phase-II training BGE-index fingerprint")
-        try:
-            corpus = load_corpus(corpus_path)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not load the KILT corpus required for {dataset_name}"
-            ) from exc
-        corpus_docs = [_corpus_text(item) for item in corpus]
-        corpus_ids = [_corpus_id(item, index) for index, item in enumerate(corpus)]
-        corpus_hashes = [_text_sha256(text) for text in corpus_docs]
-        corpus_urls = [
-            _corpus_page_url(item, index) for index, item in enumerate(corpus)
-        ]
-        corpus_digest = _corpus_sha256(corpus_ids, corpus_hashes, corpus_urls)
-        if not corpus_docs:
-            raise ValueError("The retrieval corpus is empty")
-        if len(corpus_ids) != len(set(corpus_ids)):
-            raise ValueError("Corpus document IDs must be unique")
+    if corpus_path is None or doc_embeddings_path is None:
+        raise ValueError("Paper ablations require corpus_path and doc_embeddings_path")
+    checkpoint_config = CLaRaConfig.from_pretrained(seed_checkpoints[0][1])
+    training_index_sha256 = getattr(
+        checkpoint_config, "aria_training_retrieval_index_sha256", None
+    )
+    if not isinstance(training_index_sha256, str) or len(training_index_sha256) != 64:
+        raise ValueError("Checkpoint lacks its Phase-II training BGE-index fingerprint")
+    try:
+        corpus = load_corpus(corpus_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load the KILT corpus required for {dataset_name}"
+        ) from exc
+    corpus_docs = [_corpus_text(item) for item in corpus]
+    corpus_ids = [_corpus_id(item, index) for index, item in enumerate(corpus)]
+    corpus_hashes = [_text_sha256(text) for text in corpus_docs]
+    corpus_urls = [
+        _corpus_page_url(item, index) for index, item in enumerate(corpus)
+    ]
+    corpus_digest = _corpus_sha256(corpus_ids, corpus_hashes, corpus_urls)
+    if not corpus_docs:
+        raise ValueError("The retrieval corpus is empty")
+    if len(corpus_ids) != len(set(corpus_ids)):
+        raise ValueError("Corpus document IDs must be unique")
 
-        embedding_artifact = _format_artifact_path(
-            doc_embeddings_path,
-            dataset=dataset_name,
-            compression_rate=compression_rate,
+    embedding_artifact = _format_artifact_path(
+        doc_embeddings_path,
+        dataset=dataset_name,
+        compression_rate=compression_rate,
+    )
+    doc_embeddings, evaluation_index_sha256 = load_doc_embeddings(
+        embedding_artifact,
+        len(corpus_docs),
+        expected_ids=corpus_ids,
+        expected_hashes=corpus_hashes,
+        expected_page_ids=corpus_urls,
+        return_index_sha256=True,
+    )
+    _assert_normal_retrieval_is_not_training_index(
+        checkpoint_config,
+        evaluation_corpus_sha256=corpus_digest,
+        evaluation_index_sha256=evaluation_index_sha256,
+    )
+    if doc_embeddings.shape[1] != 1024:
+        raise ValueError(
+            "ARIA requires BGE-large-en-v1.5 document embeddings with shape "
+            f"(N, 1024), got {tuple(doc_embeddings.shape)}"
         )
-        doc_embeddings, evaluation_index_sha256 = load_doc_embeddings(
-            embedding_artifact,
-            len(corpus_docs),
-            expected_ids=corpus_ids,
-            expected_hashes=corpus_hashes,
-            expected_page_ids=corpus_urls,
-            return_index_sha256=True,
+    if baseline_documents is not None:
+        (
+            baseline_candidate_doc_ids,
+            baseline_candidate_page_ids,
+            _,
+        ) = _map_clara_candidates_to_corpus(
+            baseline_documents,
+            corpus_docs=corpus_docs,
+            corpus_ids=corpus_ids,
+            corpus_page_ids=corpus_urls,
         )
-        _assert_normal_retrieval_is_not_training_index(
-            checkpoint_config,
-            evaluation_corpus_sha256=corpus_digest,
-            evaluation_index_sha256=evaluation_index_sha256,
-        )
-        if doc_embeddings.shape[1] != 1024:
-            raise ValueError(
-                "ARIA requires BGE-large-en-v1.5 document embeddings with shape "
-                f"(N, 1024), got {tuple(doc_embeddings.shape)}"
-            )
+    if ablation_name != "clara_baseline":
         bm25_index = _BM25Index().build(corpus_docs)
 
     checkpoint_results: List[Dict[str, Any]] = []
@@ -340,10 +350,10 @@ def run_ablation(
                 questions=questions,
                 gold_answers=gold_answers,
                 example_ids=example_ids,
+                gold_doc_ids=gold_document_ids,
                 documents=baseline_documents,
                 clara_candidate_doc_ids=baseline_candidate_doc_ids,
                 clara_candidate_page_ids=baseline_candidate_page_ids,
-                clara_gold_candidate_indices=baseline_gold_candidate_indices,
                 batch_size=batch_size,
                 max_new_tokens=max_new_tokens,
             )
@@ -357,7 +367,7 @@ def run_ablation(
         [path for _, path in seed_checkpoints],
     )
     aggregated["rag_configuration"] = ablation_name
-    aggregated["answer_alias_contract"] = EVALUATION_ANSWER_ALIAS_CONTRACT
+    aggregated["answer_contract"] = EVALUATION_ANSWER_CONTRACT
     aggregated["clara_archive_sha256"] = (
         dict(_REPOSITORY_EVAL_ARCHIVE_SHA256)
         if ablation_name == "clara_baseline"
@@ -465,7 +475,7 @@ def main() -> None:
         "--eval_data_path",
         type=str,
         required=True,
-        help="Alias-complete DatasetDict created by `aria-data --stage eval`",
+        help="Scalar-answer DatasetDict created by `aria-data --stage eval`",
     )
     parser.add_argument(
         "--clara_archive_dir",
@@ -496,10 +506,8 @@ def main() -> None:
         parser.error("--batch_size and --max_new_tokens must be positive")
     if args.max_new_tokens != PAPER_MAX_NEW_TOKENS:
         parser.error("Paper-protocol ablation requires --max_new_tokens=64")
-    if args.ablation != "clara_baseline" and (
-        args.corpus_path is None or args.doc_embeddings is None
-    ):
-        parser.error("non-CLaRa ablations require --corpus_path and --doc_embeddings")
+    if args.corpus_path is None or args.doc_embeddings is None:
+        parser.error("paper ablations require --corpus_path and --doc_embeddings")
     if args.ablation == "clara_baseline" and args.clara_archive_dir is None:
         parser.error("--ablation clara_baseline requires --clara_archive_dir")
     if args.ablation != "clara_baseline" and args.clara_archive_dir is not None:

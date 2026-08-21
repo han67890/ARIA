@@ -41,7 +41,7 @@ from openrlhf.utils.aria_provenance import (
 import math
 import string
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections import Counter, OrderedDict
 import numpy as np
 
@@ -55,10 +55,13 @@ RETRIEVAL_STRAIGHT_THROUGH_SCHEME = "hard-forward-soft-permutation-v1"
 CFRS_SOFT_PERMUTATION_TEMPERATURE = 0.1
 ARIA_NO_COMPRESSION_CONFIGURATION = "no_compression"
 ARIA_NO_COMPRESSION_SCHEME = "first-pass-top5-raw-direct-context-v1"
-ARIA_NO_COMPRESSION_CONTEXT_POLICY = "fixed-32768-right-truncate-if-needed-v1"
+ARIA_NO_COMPRESSION_CONTEXT_POLICY = (
+    "fixed-32768-evidence-tail-truncate-question-preserving-v2"
+)
 ARIA_NO_COMPRESSION_CONTEXT_CEILING = 32_768
 ARIA_NO_COMPRESSION_MAX_NEW_TOKENS = 64
 ORACLE_TOP100_PROTOCOL = "bge-top100-page-dedup-tail-inject-annotation-order-v2"
+ORACLE_QCA_PROTOCOL = "surface-qca-label-only-v1"
 CLARA_SELECTOR_SCHEME = "hard-forward-soft-backward-st-topk-v1"
 CLARA_DOCUMENT_REPRESENTATION_SCHEME = "frozen-variable-memory-masked-mean-v2"
 CLARA_PHASE2_OBJECTIVE = "answer-cross-entropy-only-v1"
@@ -101,8 +104,13 @@ def _base_decoder_only(model: nn.Module):
     disable = getattr(model, "disable_adapters", None)
     enable = getattr(model, "enable_adapters", None)
     if not callable(disable) or not callable(enable):
+        peft_config = getattr(model, "peft_config", None)
+        if not peft_config:
+            # A plain Transformers decoder already is the adapter-free base.
+            yield
+            return
         raise RuntimeError(
-            "CFRS requires an adapter API that can expose the frozen base decoder"
+            "Adapter-free decoding requires an API that can expose the base decoder"
         )
     disable()
     try:
@@ -137,6 +145,33 @@ class QCAResult:
     reasoning:     str = ""
 
 
+def _normalize_qca_reference_type(
+    reference_type: Union[QuestionType, str],
+) -> QuestionType:
+    try:
+        return (
+            reference_type
+            if isinstance(reference_type, QuestionType)
+            else QuestionType(reference_type)
+        )
+    except (TypeError, ValueError) as exc:
+        allowed = ", ".join(question_type.value for question_type in QuestionType)
+        raise ValueError(
+            f"QCA reference type must be one of {allowed}; got {reference_type!r}"
+        ) from exc
+
+
+def _qca_label_only_override(
+    result: QCAResult,
+    reference_type: Union[QuestionType, str],
+) -> QCAResult:
+    """Replace only the routed type while preserving the surface-QCA record."""
+    return replace(
+        result,
+        question_type=_normalize_qca_reference_type(reference_type),
+    )
+
+
 # Machine-readable weights/metadata for Appendix Tables A51-A52. Predicates are
 # evaluated below because several combine phrase, NER spans, and dependency tests.
 _QCA_RULES_PATH = Path(__file__).resolve().parents[1] / "configs" / "qca_rules.json"
@@ -147,13 +182,6 @@ _QCA_RULE_WEIGHTS: Dict[str, float] = {
 }
 _QCA_TOTAL_WEIGHT = sum(_QCA_RULE_WEIGHTS.values())
 _QCA_ENTITY_TYPES = set(_QCA_RULE_SPEC["entity_types"])
-# Appendix Tables A51--A52 distinguish the strongest explicit phrase families
-# from the remaining (partly count-driven) rules.  Resolve cross-category
-# conflicts by these tiers, not by a blanket "any H beats any A" rule.
-_QCA_EXPLICIT_HOP_RULES = frozenset({"H02", "H03", "H04", "H05"})
-_QCA_EXPLICIT_ASPECT_RULES = frozenset(
-    {"A01", "A02", "A03", "A04", "A05", "A06"}
-)
 _QCA_BRIDGE_CONNECTIVES = ("that", "which", "whose", "where")
 _QCA_COMPARATIVE_RE = re.compile(
     r"\b(?:same|different|difference|similar|compare|contrast|more|less|better|worse|"
@@ -544,11 +572,11 @@ class QuestionComplexityAssessor:
         aspect_fired = [rule_id for rule_id in fired if rule_id.startswith("A")]
         # The original routing contract gives every hop rule precedence over
         # aspect rules, but accepts a hop route only when at least two named
-        # entities are present.  The entity guard prevents a lexical hop cue
-        # by itself from fabricating a multi-document dependency.
+        # entities are present. A hop cue with fewer than two entities falls
+        # through to Simple rather than being reclassified as Multi-Aspect.
         if hop_fired and len(entities) >= 2:
             qtype = QuestionType.MULTI_HOP
-        elif aspect_fired:
+        elif aspect_fired and not hop_fired:
             qtype = QuestionType.MULTI_ASPECT
         else:
             qtype = QuestionType.SIMPLE
@@ -1610,9 +1638,7 @@ class RAGPipelineConfig:
     # ── 创新点2: 自适应压缩率 ──────────────────────────────────────────────
     use_acr:                 bool  = True   # Adaptive Compression Rate
     # ``adaptive`` is Eq. (8). ``uniform_budget`` and ``static_query`` below
-    # are deterministic release conventions for the paper's matched controls:
-    # the paper fixes their aggregate budget/topology but does not uniquely
-    # specify per-example integer rounding or the static query construction.
+    # are deterministic conventions for additional retrained release controls.
     acr_allocation_mode:     str   = "adaptive"
     uniform_evidence_token_budget: int = MATCHED_EVIDENCE_TOKEN_BUDGET
     uniform_constant_ratio:  float = 0.625
@@ -1684,7 +1710,7 @@ RAG_CONFIGURATION_SPECS: Dict[str, Dict[str, Any]] = {
     "remove_igfr": {"use_igfr": False},
     "remove_mads": {"use_mads": False},
     "remove_ccef": {"use_ccef": False},
-    # Appendix A.31 matched, independently retrained controls (16x).
+    # Additional independently retrained release controls (16x).
     "remove_cfrs": {"use_cfrs": False},
     "uniform_acr": {
         "use_acr": False,
@@ -1701,7 +1727,7 @@ RAG_CONFIGURATION_SPECS: Dict[str, Dict[str, Any]] = {
         "use_mtfrl": False,
         "second_retrieval_mode": "static_query",
     },
-    # Appendix A.31 fixed-checkpoint forward-path interventions.
+    # Paper fixed-checkpoint forward-path interventions.
     "fixed_remove_cfrs": {"use_cfrs": False},
     "fixed_uniform_acr": {
         "use_acr": False,
@@ -1783,7 +1809,8 @@ def create_paper_rag_config(
         raise ValueError("compression_rate must be positive")
     if configuration in MATCHED_RETRAINING_CONFIGURATIONS and compression_rate != 16:
         raise ValueError(
-            "the budget/topology-matched retraining study is defined only at 16x"
+            "the additional budget/topology-matched release controls are "
+            "defined only at 16x"
         )
     values: Dict[str, Any] = {
         "top_k": 5,
@@ -1808,6 +1835,8 @@ def create_paper_rag_config(
 @dataclass
 class RAGDiagnostics:
     question_type:       str   = ""
+    rule_question_type:  str   = ""
+    oracle_question_type: str  = ""
     qca_confidence:      float = 0.0
     bm25_weight:         float = 0.5
     dense_weight:        float = 0.5
@@ -2074,11 +2103,21 @@ class RAGEnhancementPipeline:
         self,
         queries: Sequence[str],
         query_embeddings: Optional[torch.Tensor],
+        precomputed_qca: Optional[Sequence[QCAResult]] = None,
     ) -> Tuple[List[List[_RetrievedDoc]], List[QCAResult]]:
         """Batch QCA/AHR for the first 4,000-candidate retrieval pass."""
         if not queries:
             raise ValueError("initial retrieval batch must not be empty")
-        if self.config.use_qca:
+        if precomputed_qca is not None:
+            if len(precomputed_qca) != len(queries):
+                raise ValueError("precomputed QCA results must align with queries")
+            qca_results = list(precomputed_qca)
+            if any(
+                result.question != query
+                for result, query in zip(qca_results, queries)
+            ):
+                raise ValueError("precomputed QCA result belongs to a different query")
+        elif self.config.use_qca:
             qca_results = self.qca.assess_batch(list(queries))
         else:
             qca_results = [
@@ -2148,6 +2187,7 @@ class RAGEnhancementPipeline:
                 reasoning="Direct single-question routing",
             )
         diag.question_type  = qca_r.question_type.value
+        diag.rule_question_type = qca_r.question_type.value
         diag.qca_confidence = qca_r.confidence
         bw, dw = _ahr_get_weights(qca_r)
         if not cfg.use_ahr:
@@ -4688,8 +4728,10 @@ class CLaRa(PreTrainedModel):
         max_new_tokens: int,
     ) -> Tuple[List[str], torch.Tensor, torch.Tensor, int]:
         """Generate directly from the first-pass top-five raw passages."""
-        if max_new_tokens <= 0 or max_new_tokens >= ARIA_NO_COMPRESSION_CONTEXT_CEILING:
-            raise ValueError("ARIA-NoComp generation budget must fit the 32k context")
+        if max_new_tokens != ARIA_NO_COMPRESSION_MAX_NEW_TOKENS:
+            raise ValueError(
+                "ARIA-NoComp requires the fixed 64-token generation reserve"
+            )
         if len(questions) == 0 or len(evidence) != len(questions):
             raise ValueError("ARIA-NoComp questions and evidence must align")
         if any(
@@ -4722,14 +4764,71 @@ class CLaRa(PreTrainedModel):
                 raise ValueError("ARIA-NoComp raw passages must contain decoder tokens")
             document_token_counts.append(token_count)
 
-        prompts = [
-            self._blend_standard_prompt(context, question, None)
-            for question, context in zip(questions, raw_contexts)
-        ]
-        if any(not isinstance(prompt, str) or not prompt for prompt in prompts):
-            raise RuntimeError("ARIA-NoComp failed to build a direct-context QA prompt")
         context_limit = self._resolve_no_compression_context_limit()
         prompt_limit = context_limit - max_new_tokens
+        prompts: List[str] = []
+        retained_contexts: List[str] = []
+        for row_index, (question, raw_context) in enumerate(
+            zip(questions, raw_contexts)
+        ):
+            prompt = self._blend_standard_prompt(raw_context, question, None)
+            if not isinstance(prompt, str) or not prompt:
+                raise RuntimeError("ARIA-NoComp failed to build a direct-context QA prompt")
+            prompt_ids = self.decoder_tokenizer.encode(
+                prompt,
+                add_special_tokens=False,
+                truncation=False,
+            )
+            retained_context = raw_context
+            if len(prompt_ids) > prompt_limit:
+                prompt_without_evidence = self._blend_standard_prompt("", question, None)
+                if (
+                    not isinstance(prompt_without_evidence, str)
+                    or not prompt_without_evidence
+                    or len(
+                        self.decoder_tokenizer.encode(
+                            prompt_without_evidence,
+                            add_special_tokens=False,
+                            truncation=False,
+                        )
+                    )
+                    > prompt_limit
+                ):
+                    raise ValueError(
+                        "ARIA-NoComp system/question prompt cannot fit the 32k "
+                        f"context at row {row_index}"
+                    )
+                lower, upper = 0, len(raw_context)
+                while lower < upper:
+                    midpoint = (lower + upper + 1) // 2
+                    candidate_context = raw_context[:midpoint]
+                    candidate_prompt = self._blend_standard_prompt(
+                        candidate_context, question, None
+                    )
+                    candidate_length = len(
+                        self.decoder_tokenizer.encode(
+                            candidate_prompt,
+                            add_special_tokens=False,
+                            truncation=False,
+                        )
+                    )
+                    if candidate_length <= prompt_limit:
+                        lower = midpoint
+                    else:
+                        upper = midpoint - 1
+                retained_context = raw_context[:lower]
+                prompt = self._blend_standard_prompt(retained_context, question, None)
+            prompts.append(prompt)
+            retained_contexts.append(retained_context)
+        for row_index, retained_context in enumerate(retained_contexts):
+            if retained_context != raw_contexts[row_index]:
+                document_token_counts[row_index] = len(
+                    self.decoder_tokenizer.encode(
+                        retained_context,
+                        add_special_tokens=False,
+                        truncation=False,
+                    )
+                )
         decoder_inputs = self.decoder_tokenizer(
             prompts,
             return_tensors="pt",
@@ -4737,16 +4836,13 @@ class CLaRa(PreTrainedModel):
             add_special_tokens=False,
             truncation=False,
         )
-        # Work on token IDs, not passage strings.  The reported ~2,950-token
-        # path is unchanged; only an out-of-contract overflow is right-trimmed
-        # to preserve the old diagnostic's explicit 32k ceiling.
-        dec_input_ids = decoder_inputs["input_ids"][:, :prompt_limit].to(
-            self.decoder.device
-        )
-        dec_attention_mask = decoder_inputs["attention_mask"][:, :prompt_limit].to(
-            self.decoder.device
-        )
+        dec_input_ids = decoder_inputs["input_ids"].to(self.decoder.device)
+        dec_attention_mask = decoder_inputs["attention_mask"].to(self.decoder.device)
         prompt_lengths = dec_attention_mask.sum(dim=1).long()
+        if torch.any(prompt_lengths > prompt_limit):
+            raise RuntimeError(
+                "ARIA-NoComp evidence-tail truncation exceeded the reserved prompt budget"
+            )
         if "decoder_adapter" not in self.adapter_keys:
             raise ValueError("ARIA-NoComp requires the Phase-II decoder_adapter")
         self.decoder.set_adapter("decoder_adapter")
@@ -4789,7 +4885,11 @@ class CLaRa(PreTrainedModel):
         time_count: bool = False,
         return_first_pass_indices: bool = False,
         oracle_gold_indices: Optional[Sequence[Sequence[int]]] = None,
+        oracle_pool_records: Optional[Sequence[OraclePoolRecord]] = None,
         no_compression: bool = False,
+        qca_reference_types: Optional[
+            Sequence[Union[QuestionType, str]]
+        ] = None,
     ) -> Tuple[List[str], torch.Tensor]:
         """Run the full two-round ARIA inference algorithm from Appendix A.1.
 
@@ -4808,7 +4908,11 @@ class CLaRa(PreTrainedModel):
                 "the integrated retrieval pipeline"
             )
         if no_compression:
-            if documents is not None or oracle_gold_indices is not None:
+            if (
+                documents is not None
+                or oracle_gold_indices is not None
+                or oracle_pool_records is not None
+            ):
                 raise ValueError(
                     "ARIA-NoComp supports only Normal full-corpus retrieval"
                 )
@@ -4842,6 +4946,48 @@ class CLaRa(PreTrainedModel):
             )
         if self._bge_projection is None:
             raise RuntimeError("ARIA retrieval requires a fitted W_BGE projection")
+        normalized_qca_reference_types: Optional[List[QuestionType]] = None
+        if qca_reference_types is not None:
+            if isinstance(qca_reference_types, (str, bytes)) or len(
+                qca_reference_types
+            ) != len(questions):
+                raise ValueError(
+                    "qca_reference_types must align one-to-one with questions"
+                )
+            if (
+                documents is not None
+                or oracle_gold_indices is not None
+                or oracle_pool_records is not None
+                or no_compression
+            ):
+                raise ValueError(
+                    "QCA label-only overrides require Normal full-corpus ARIA evaluation"
+                )
+            if (
+                getattr(self.config, "aria_rag_configuration", None) != "full"
+                or self.compr_rate != 16
+                or not all(
+                    (
+                        self._rag_config.use_qca,
+                        self._rag_config.use_ahr,
+                        self._rag_config.use_igfr,
+                        self._rag_config.use_mads,
+                        self._rag_config.use_ccef,
+                        self._rag_config.use_cfrs,
+                        self._rag_config.use_acr,
+                        self._rag_config.use_mtfrl,
+                    )
+                )
+                or self._rag_config.acr_allocation_mode != "adaptive"
+                or self._rag_config.second_retrieval_mode != "memory_feedback"
+            ):
+                raise ValueError(
+                    "QCA label-only overrides require the full ARIA configuration at 16x"
+                )
+            normalized_qca_reference_types = [
+                _normalize_qca_reference_type(value)
+                for value in qca_reference_types
+            ]
         if oracle_gold_indices is not None:
             if documents is not None:
                 raise ValueError("Oracle fixed pools cannot be combined with documents")
@@ -4864,6 +5010,37 @@ class CLaRa(PreTrainedModel):
                     raise ValueError(
                         f"oracle_gold_indices[{row_index}] contains an invalid corpus index"
                     )
+            if oracle_pool_records is not None:
+                if len(oracle_pool_records) != len(questions):
+                    raise ValueError(
+                        "oracle_pool_records must align one-to-one with questions"
+                    )
+                for row_index, record in enumerate(oracle_pool_records):
+                    if not isinstance(record, OraclePoolRecord):
+                        raise ValueError(
+                            f"oracle_pool_records[{row_index}] must be an OraclePoolRecord"
+                        )
+                    if record.protocol != ORACLE_TOP100_PROTOCOL:
+                        raise ValueError("Oracle pool record uses an unsupported protocol")
+                    if (
+                        len(record.pool_indices) != 100
+                        or len(record.pool_page_ids) != 100
+                        or len(set(record.pool_page_ids)) != 100
+                        or any(index < 0 or index >= corpus_size for index in record.pool_indices)
+                    ):
+                        raise ValueError(
+                            f"oracle_pool_records[{row_index}] violates the page-unique top-100 contract"
+                        )
+                    gold_pages = {
+                        self.rag_pipeline.ahr.corpus_page_ids[int(index)]
+                        for index in oracle_gold_indices[row_index]
+                    }
+                    if not gold_pages.issubset(record.pool_page_ids):
+                        raise ValueError(
+                            f"oracle_pool_records[{row_index}] omits an annotated positive page"
+                        )
+        elif oracle_pool_records is not None:
+            raise ValueError("oracle_pool_records require oracle_gold_indices")
 
         self.eval()
         query_time = compress_time = generate_time = 0.0
@@ -4889,28 +5066,32 @@ class CLaRa(PreTrainedModel):
             qca_results: List[QCAResult] = []
             diagnostics: List[RAGDiagnostics] = []
             oracle_records: Optional[List[OraclePoolRecord]] = None
+            rule_qca_results: Optional[List[QCAResult]] = None
             if oracle_gold_indices is not None:
                 dense_corpus = self.rag_pipeline.ahr.dense_embeddings
                 if dense_corpus is None:
                     raise RuntimeError("Oracle top-100 requires the fixed BGE corpus index")
-                base_index_rows = _chunked_inner_product_topk_unique_pages(
-                    F.normalize(
-                        query_bge.detach().float().cpu(),
-                        dim=-1,
-                        eps=self._rag_config.numerical_epsilon,
-                    ),
-                    dense_corpus,
-                    self.rag_pipeline.ahr.corpus_page_ids,
-                    100,
-                )
-                oracle_records = [
-                    _construct_oracle_top100_indices(
-                        base_index_rows[row].tolist(),
-                        oracle_gold_indices[row],
-                        corpus_page_ids=self.rag_pipeline.ahr.corpus_page_ids,
+                if oracle_pool_records is None:
+                    base_index_rows = _chunked_inner_product_topk_unique_pages(
+                        F.normalize(
+                            query_bge.detach().float().cpu(),
+                            dim=-1,
+                            eps=self._rag_config.numerical_epsilon,
+                        ),
+                        dense_corpus,
+                        self.rag_pipeline.ahr.corpus_page_ids,
+                        100,
                     )
-                    for row in range(len(questions))
-                ]
+                    oracle_records = [
+                        _construct_oracle_top100_indices(
+                            base_index_rows[row].tolist(),
+                            oracle_gold_indices[row],
+                            corpus_page_ids=self.rag_pipeline.ahr.corpus_page_ids,
+                        )
+                        for row in range(len(questions))
+                    ]
+                else:
+                    oracle_records = list(oracle_pool_records)
                 if self._rag_config.use_qca:
                     initial_qca = self.rag_pipeline.qca.assess_batch(questions)
                 else:
@@ -4954,9 +5135,23 @@ class CLaRa(PreTrainedModel):
                     )
                 self._oracle_pool_records.extend(oracle_records)
             elif documents is None:
-                initial_pools, initial_qca = self.rag_pipeline.retrieve_initial_batch(
-                    questions, query_bge
-                )
+                if normalized_qca_reference_types is not None:
+                    rule_qca_results = self.rag_pipeline.qca.assess_batch(questions)
+                    initial_qca = [
+                        _qca_label_only_override(result, reference_type)
+                        for result, reference_type in zip(
+                            rule_qca_results, normalized_qca_reference_types
+                        )
+                    ]
+                    initial_pools, _ = self.rag_pipeline.retrieve_initial_batch(
+                        questions,
+                        query_bge,
+                        precomputed_qca=initial_qca,
+                    )
+                else:
+                    initial_pools, initial_qca = (
+                        self.rag_pipeline.retrieve_initial_batch(questions, query_bge)
+                    )
             else:
                 initial_pools = initial_qca = None
             for batch_index, question in enumerate(questions):
@@ -5007,6 +5202,14 @@ class CLaRa(PreTrainedModel):
                         query_emb=query_bge[batch_index],
                         diagnostics=diag,
                     )
+
+                if rule_qca_results is not None:
+                    diag.rule_question_type = rule_qca_results[
+                        batch_index
+                    ].question_type.value
+                    diag.oracle_question_type = qca_result.question_type.value
+                elif not diag.rule_question_type:
+                    diag.rule_question_type = qca_result.question_type.value
 
                 if len(scored) != requested_top_k:
                     raise RuntimeError(

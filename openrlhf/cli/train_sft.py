@@ -58,6 +58,7 @@ from openrlhf.models.modeling_aria import (
     _tensor_is_finite_in_chunks,
 )
 from openrlhf.datasets.sft_dataset import make_collate_fn
+from openrlhf.cli.aria_data import PAPER_PHASE2_EPOCH_SEEDS
 from openrlhf.utils.aria_provenance import (
     CORPUS_SHA256_SCHEME,
     CORPUS_ID_FIELDS as _ID_FIELDS,
@@ -130,7 +131,9 @@ class _ScheduledEpochSFTDataset(TorchDataset):
                 for benchmark in ("nq", "hotpotqa", "musique", "2wikimultihopqa")
             }
             if dict(counts) != expected_counts:
-                raise ValueError(f"{name} is not class-balanced at 9,600 rows: {counts}")
+                raise ValueError(
+                    f"{name} is not benchmark-balanced at 9,600 rows: {counts}"
+                )
         self._active_epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -1188,10 +1191,12 @@ def setup_datasets(args: argparse.Namespace, tokenizer, strategy, model: CLaRa):
         epoch_seeds = manifest.get("epoch_seed_schedule")
         if (
             not isinstance(epoch_seeds, list)
-            or len(epoch_seeds) != 5
-            or len(set(epoch_seeds)) != 5
+            or tuple(epoch_seeds) != PAPER_PHASE2_EPOCH_SEEDS
         ):
-            raise ValueError("Phase-II manifest must declare five distinct epoch seeds")
+            raise ValueError(
+                "Phase-II manifest must declare the paper epoch seed schedule "
+                f"{PAPER_PHASE2_EPOCH_SEEDS}"
+            )
         training_retrieval = manifest.get("training_retrieval")
         if (
             not isinstance(training_retrieval, dict)
@@ -1856,7 +1861,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         default="full",
         help=(
             "Full ARIA or one explicit separately trained configuration. The "
-            "matched controls are remove_cfrs, uniform_acr, "
+            "additional release controls are remove_cfrs, uniform_acr, "
             "static_second_retrieval, and remove_all_coupling; fixed_* and "
             "forward_path_off labels are inference-only."
         ),
@@ -2043,7 +2048,7 @@ def validate_arguments(args: argparse.Namespace):
         and args.compress_rate != 16
     ):
         raise ValueError(
-            "the paper's budget/topology-matched retraining controls are defined "
+            "the additional budget/topology-matched release controls are defined "
             "only at 16x compression"
         )
 

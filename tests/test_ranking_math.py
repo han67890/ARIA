@@ -30,6 +30,7 @@ from openrlhf.models.modeling_aria import (
     _fixed_memory_prompt_max_length,
     _merge_bounded_retrieval_pool,
     _mtfrl_hidden_width,
+    _qca_label_only_override,
     _pack_variable_encoder_memory_rows,
     _prune_padded_memory_slots,
     _tensor_is_finite_in_chunks,
@@ -142,6 +143,80 @@ def test_submission_qca_hop_match_requires_two_entities(monkeypatch):
     assert "H05" in result.matched_rules
     assert result.entity_count == 1
     assert result.question_type is not QuestionType.MULTI_HOP
+
+
+def test_submission_qca_one_entity_hop_aspect_conflict_is_simple(monkeypatch):
+    nlp = _FakeSpacyPipeline()
+    monkeypatch.setattr(modeling_aria, "_qca_get_spacy", lambda: nlp)
+
+    result = QuestionComplexityAssessor().assess(
+        "Compare Alice in which country she was born."
+    )
+
+    assert {"H02", "A01"}.issubset(result.matched_rules)
+    assert result.entity_count == 1
+    assert result.question_type is QuestionType.SIMPLE
+
+
+def test_oracle_qca_override_replaces_only_the_question_type():
+    surface = QCAResult(
+        question="Compare Alice in which country she was born.",
+        question_type=QuestionType.SIMPLE,
+        confidence=0.375,
+        hop_count=1,
+        entity_count=1,
+        sub_questions=["surface subquestion"],
+        matched_rules=("H02", "A01"),
+        reasoning="surface reasoning",
+    )
+
+    overridden = _qca_label_only_override(surface, "multi_hop")
+
+    assert overridden.question_type is QuestionType.MULTI_HOP
+    assert overridden.question == surface.question
+    assert overridden.confidence == surface.confidence
+    assert overridden.hop_count == surface.hop_count
+    assert overridden.entity_count == surface.entity_count
+    assert overridden.sub_questions is surface.sub_questions
+    assert overridden.matched_rules is surface.matched_rules
+    assert overridden.reasoning == surface.reasoning
+
+
+def test_oracle_qca_override_reaches_ahr_before_initial_candidate_retrieval():
+    captured = SimpleNamespace(qca_results=None)
+
+    class _CapturingAHR:
+        def retrieve_batch(
+            self, queries, qca_results, *, query_embeddings, top_k
+        ):
+            captured.qca_results = list(qca_results)
+            assert list(queries) == ["question"]
+            assert query_embeddings is None
+            assert top_k == 4000
+            return [[]]
+
+    surface = QCAResult(
+        question="question",
+        question_type=QuestionType.SIMPLE,
+        confidence=0.0,
+        hop_count=1,
+        entity_count=0,
+        sub_questions=["question"],
+    )
+    overridden = _qca_label_only_override(surface, QuestionType.MULTI_HOP)
+    pipeline = RAGEnhancementPipeline(
+        qca=None,
+        ahr=_CapturingAHR(),
+        ccef=None,
+        config=RAGPipelineConfig(),
+    )
+
+    _, returned = pipeline.retrieve_initial_batch(
+        ["question"], None, precomputed_qca=[overridden]
+    )
+
+    assert captured.qca_results[0].question_type is QuestionType.MULTI_HOP
+    assert returned == [overridden]
 
 
 def test_qca_explicit_hop_phrase_overrides_explicit_aspect_phrase(monkeypatch):

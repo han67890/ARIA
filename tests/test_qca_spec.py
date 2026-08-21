@@ -18,4 +18,5 @@ def test_qca_rule_table_is_complete_and_single_sourced():
     }
     classification = payload["classification"]
     assert classification["multi_hop_min_entities"] == 2
+    assert classification["multi_aspect_requires_no_hop"] is True
     assert classification["hop_precedes_aspect"] is True

@@ -17,6 +17,7 @@ from openrlhf.models.modeling_aria import (
     CLaRa,
 )
 from openrlhf.trainer.sft_trainer import (
+    SFTTrainer,
     compose_aria_training_loss,
 )
 
@@ -359,3 +360,14 @@ def test_phase2_collator_defers_realized_prompt_until_after_retrieval():
     assert "dec_input_ids" not in batch
     assert "labels" not in batch
     assert "query_position_mask" not in batch
+
+
+def test_paper_validation_cem_accepts_only_the_scalar_supervision_answer():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    assert trainer._calculate_accuracy(
+        ["The answer is canonical."], ["canonical"]
+    ) == 1
+    with pytest.raises(ValueError, match="scalar answer"):
+        trainer._calculate_accuracy(
+            ["The answer is an alias."], [["canonical", "alias"]]
+        )

@@ -23,10 +23,11 @@ targets and exact source counts.
 ## Phase II
 
 The four validated pools are sampled without replacement into five
-class-balanced epoch views of 38,400 rows (9,600 per benchmark). Pass the five
-fixed epoch-sampling seeds through `--epoch-seeds E0 E1 E2 E3 E4`; their values
-are recorded in the manifest. Epoch-sampling seeds and the five independent
-training-run seeds are separate experimental controls.
+benchmark-balanced epoch views of 38,400 rows (9,600 per benchmark). The paper
+epoch-view schedule is `(42, 123, 456, 789, 2024)` and is the CLI default; an
+explicit `--epoch-seeds` value must match it exactly. The manifest records this
+schedule. Epoch-view sampling and independent training-run initialization are
+separate controls even though both use the same numeric sequence.
 
 | Source pool | Rows |
 |---|---:|
@@ -41,13 +42,12 @@ Set every path and seed to the provenance-backed values for the experiment:
 aria-data --stage phase2 \
   --output-dir data/aria \
   --test-url-source local:/data/official_test_urls.txt \
-  --epoch-seeds "$EPOCH_SEED_0" "$EPOCH_SEED_1" "$EPOCH_SEED_2" \
-                "$EPOCH_SEED_3" "$EPOCH_SEED_4" \
+  --epoch-seeds 42 123 456 789 2024 \
   --training-retrieval-index-sha256 "$BGE_INDEX_SHA256" \
-  --musique-audit-manifest /data/musique_audit_manifest.json \
   --phase2-nq-source local:/data/nq_train.jsonl \
   --phase2-hotpotqa-source local:/data/hotpotqa_train.jsonl \
   --phase2-musique-source local:/data/musique_augmented_train.jsonl \
+  --phase2-musique-derived-manifest /data/musique_derived_manifest.json \
   --phase2-2wikimultihopqa-source local:/data/2wiki_train.jsonl
 ```
 
@@ -64,14 +64,10 @@ use `gold_doc_ids` as corpus-level identifiers across all candidate lists.
 For evaluation artifacts, every source row must provide `gold_doc_ids` as an
 explicit, complete full-KILT annotation independent of `docs` and `pos_index`;
 an empty list explicitly marks a row outside the Recall denominator `Q_sup`.
-Every evaluation row must also provide a separate, non-empty list of
-benchmark-provided answer aliases (the default input field is `gold_answers`).
-The scalar `answer` and this explicit list are de-duplicated into the stored
-`gold_answers`; the preparer does not invent spelling, normalization, or entity
-variants. Use `--phase2-<benchmark>-gold-answers-key FIELD` when an official
-source uses another field name. The evaluation manifest records
-`benchmark_provided_gold_aliases`, and evaluators reject older manifests or
-rows lacking that list.
+Every evaluation row must also provide one non-empty benchmark reference string
+in `answer` (or the explicitly configured answer field). The evaluation
+manifest records the scalar single-reference contract, and EM, CEM, and F1 all
+use that same string.
 Document IDs are mapped through the aligned corpus's canonical `page_url`, so
 multiple supporting passages from one page count once.
 This matters because an annotated positive may be absent from the source
@@ -82,55 +78,52 @@ contract so older candidate-derived artifacts are rejected instead of producing
 inflated Recall@5. Oracle evaluation rejects empty support lists because its
 fixed candidate pool is defined to contain at least one annotated gold page.
 MuSiQue entity variants must record exact entity preservation, ROUGE-L ≥ 0.4,
-unchanged answer/decomposition, and the Appendix A.33 human-audit manifest.
-The reported 52,107 subquestions imply only
-`52,107 - 19,938 = 32,169` strict `k-1` prefixes. The repository therefore
-defines `deterministic-partial-state-v2`: it retains all prefixes, enumerates
-non-empty prerequisite-hop subsets, and optionally exposes one unknown
-frontier question with its answer replaced by `<MISSING>`. The final-hop answer
-is never known evidence. Optional states are selected by a stable,
-parent-balanced round robin until the exact 70,845-row target is reached.
-State IDs and the selected partition are content-addressed.
+and unchanged answers and decompositions. The preparer recomputes the NER and
+ROUGE-L checks against each original parent and verifies the stored Phase-II
+training-answer field. This augmentation field is separate from the scalar
+reference used by evaluation artifacts.
 
-Generate the partial-query artifact with:
-
-```bash
-aria-data --stage musique-partial \
-  --output-dir data/aria \
-  --phase2-musique-source local:/data/musique_originals.jsonl \
-  --phase2-musique-source-id-key id \
-  --musique-decomposition-key question_decomposition
-```
-
-Because each generated query differs from its parent, parent top-5 candidates
-must not be copied. Rows remain marked `needs_candidate_retrieval=true` until
-fresh BGE top-5 candidates from the Phase-II training index are attached; the
-Phase-II normalizer rejects them until that marker is explicitly set to false.
-The generation manifest records the exact count, capacity, state-ID digest,
-and candidate-retrieval contract.
+The complete 168,745-row MuSiQue pool is a versioned historical derived source
+supplied by the artifact owner. It has four families: 19,938 originals, 52,107
+subquestion rows, 70,845 partial-chain rows, and 25,855 entity-paraphrase rows.
+These historical counts are not reconstructed from the raw original split.
+Phase-II preparation requires an `aria-musique-derived-source-v1` manifest
+supplied with that source.
+The manifest declares `total_count`, `family_counts`, the exact ordered
+`source_columns`, and the configured `field_map`. It also carries
+`source_content_sha256`, one `family_content_sha256` value per family, and
+`parent_link_sha256`. Content hashes consume each loaded row as compact,
+key-sorted UTF-8 JSON followed by a newline; the source hash follows source
+order and each family hash preserves that family's source-relative order. The
+parent-link hash applies the same encoding to
+`[family, source_row_id, parent_id, answer, decomposition]` for every row.
+The preparer recomputes every digest and checks unique source IDs, parent links,
+preserved decompositions, parent answers for partial/entity variants, and
+annotated-hop answers for subquestion rows. The supplied manifest and its own
+SHA-256 are embedded in the Phase-II output manifest. A generic
+prefix/frontier utility is available as a standalone library helper, but it is
+not a paper-data builder.
 
 The exact evaluation split sizes are NQ 6,489, HotpotQA 7,384, MuSiQue 2,417,
 and 2WikiMultiHopQA 12,576.
 
-Materialize the four official, alias-bearing splits before evaluation:
+Materialize the four official scalar-answer splits before evaluation:
 
 ```bash
 aria-data --stage eval \
   --output-dir /data/aria \
   --eval-split validation \
-  --phase2-nq-source local:/data/nq_eval_with_aliases.jsonl \
-  --phase2-hotpotqa-source local:/data/hotpotqa_eval_with_aliases.jsonl \
-  --phase2-musique-source local:/data/musique_eval_with_aliases.jsonl \
-  --phase2-2wikimultihopqa-source local:/data/2wiki_eval_with_aliases.jsonl
+  --phase2-nq-source local:/data/nq_eval.jsonl \
+  --phase2-hotpotqa-source local:/data/hotpotqa_eval.jsonl \
+  --phase2-musique-source local:/data/musique_eval.jsonl \
+  --phase2-2wikimultihopqa-source local:/data/2wiki_eval.jsonl
 ```
 
-Only use fields supplied by the benchmark or its official evaluation release.
-If such an alias-bearing source is unavailable, the repository cannot reproduce
-the paper's answer metrics and deliberately stops instead of falling back to
-the external CLaRa archives' scalar answers. Those four ZIPs are candidate
-artifacts, not evaluation-label artifacts; they are kept outside Git and passed
-with `--clara_archive_dir` only for matched-CLaRa analyses. Their filenames,
-members, and pinned SHA-256 values are listed in [evaluation.md](evaluation.md).
+The scalar answer must come from the prepared benchmark split. The four CLaRa
+ZIPs are candidate artifacts, not evaluation-label artifacts; they are kept
+outside Git and passed with `--clara_archive_dir` only for matched-CLaRa Normal
+analysis. Their filenames, members, and pinned SHA-256 values are listed in
+[evaluation.md](evaluation.md).
 
 ## Retrieval corpus
 
@@ -211,8 +204,9 @@ L2-normalizes and validates all 1,024-dimensional rows, computes the
 loader-compatible `index_sha256`, publishes the result atomically, and refuses
 to overwrite an existing output.
 
-The paper's 50,000 W_BGE alignment pairs are fitted separately with
-`scripts/fit_bge_projection.sh`. Each pair record must contain `question`,
+The paper's 50,000 W_BGE alignment pairs are supplied by a versioned alignment
+artifact and fitted with `scripts/fit_bge_projection.sh`; the repository does
+not select the pairs from raw KILT. Each pair record must contain `question`,
 `passage`, a stable `passage_id`, and `page_url`; the target embedding artifact
 must carry matching IDs and passage hashes, declare both
 `bge_model: BAAI/bge-large-en-v1.5` and
@@ -221,7 +215,7 @@ over its canonical float32 tensor. Alignment URLs are disjoint from the
 official test URLs. The saved artifact records the base model, BGE model,
 optimizer protocol, seed, and query fingerprint.
 
-Generate the aligned passage targets before fitting W_BGE with:
+Encode the versioned alignment passages before fitting W_BGE with:
 
 ```bash
 aria-build-bge alignment-targets \

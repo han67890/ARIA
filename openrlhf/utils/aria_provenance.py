@@ -40,12 +40,12 @@ EVALUATION_GOLD_DOCUMENT_CONTRACT = {
     "positive_scope": "all_annotated_positives_independent_of_candidates",
     "source": "explicit_input_field",
 }
-EVALUATION_ANSWER_ALIAS_CONTRACT = {
-    "field": "gold_answers",
-    "container": "non_empty_list",
-    "scope": "benchmark_provided_gold_aliases",
+EVALUATION_ANSWER_CONTRACT = {
+    "field": "answer",
+    "container": "non_empty_string",
+    "scope": "single_benchmark_reference",
     "source": "explicit_input_field",
-    "metric_reduction": "maximum_per_example",
+    "metric_reduction": "single_reference",
 }
 
 

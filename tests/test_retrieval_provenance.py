@@ -59,7 +59,7 @@ def _paper_checkpoint_model() -> SimpleNamespace:
         aria_rag_configuration="full",
         aria_training_seed=42,
         aria_dataset_manifest_sha256="b" * 64,
-        aria_epoch_seed_schedule=[1, 2, 3, 4, 5],
+        aria_epoch_seed_schedule=[42, 123, 456, 789, 2024],
         doc_max_length=768,
         query_max_length=256,
         stage2_input_max_length=1024,

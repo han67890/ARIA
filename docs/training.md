@@ -76,4 +76,6 @@ follows the submission equations directly.
 
 ARIA-NoComp reuses a trained Phase-II checkpoint without updating parameters.
 It concatenates the first-pass top-five raw documents and bypasses compression
-and the second round.
+and the second round. The direct prompt reserves 64 generation tokens under a
+32,768-token ceiling and truncates only the evidence tail if needed, retaining
+the system prompt and question.

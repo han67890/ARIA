@@ -18,7 +18,7 @@ import torch
 
 from openrlhf.cli.evaluate_aria import (
     ARIAEvaluator,
-    EVALUATION_ANSWER_ALIAS_CONTRACT,
+    EVALUATION_ANSWER_CONTRACT,
     PAPER_COMPRESSION_RATES,
     PAPER_MAX_NEW_TOKENS,
     PAPER_TRAINING_SEEDS,
@@ -29,8 +29,10 @@ from openrlhf.cli.evaluate_aria import (
     _corpus_text,
     _extract_example_ids,
     _extract_clara_candidate_columns,
-    _extract_gold_answers,
+    _extract_gold_answer,
+    _extract_gold_document_ids,
     _format_artifact_path,
+    _map_clara_candidates_to_corpus,
     _text_sha256,
     _assert_normal_retrieval_is_not_training_index,
     _assert_protocol_fingerprints_match,
@@ -372,14 +374,12 @@ def run_counterfactual(
         clara_archive_dir=clara_archive_dir,
     )
     questions = [item[question_key] for item in dataset]
-    gold_answers = [_extract_gold_answers(item, answer_key) for item in dataset]
+    gold_answers = [_extract_gold_answer(item, answer_key) for item in dataset]
+    gold_document_ids = _extract_gold_document_ids(dataset)
+    if gold_document_ids is None:
+        raise ValueError("Counterfactual evaluation requires prepared gold_doc_ids")
     example_ids = _extract_example_ids(dataset, dataset_name)
-    (
-        baseline_documents,
-        baseline_candidate_doc_ids,
-        baseline_candidate_page_ids,
-        baseline_gold_candidate_indices,
-    ) = _extract_clara_candidate_columns(dataset)
+    baseline_documents = _extract_clara_candidate_columns(dataset)
 
     try:
         corpus = load_corpus(corpus_path)
@@ -398,6 +398,16 @@ def run_counterfactual(
         raise ValueError("The retrieval corpus is empty")
     if len(corpus_ids) != len(set(corpus_ids)):
         raise ValueError("Corpus document IDs must be unique")
+    (
+        baseline_candidate_doc_ids,
+        baseline_candidate_page_ids,
+        _,
+    ) = _map_clara_candidates_to_corpus(
+        baseline_documents,
+        corpus_docs=corpus_docs,
+        corpus_ids=corpus_ids,
+        corpus_page_ids=corpus_urls,
+    )
 
     embedding_artifact = _format_artifact_path(
         doc_embeddings_path,
@@ -485,6 +495,7 @@ def run_counterfactual(
                     questions=questions,
                     gold_answers=gold_answers,
                     example_ids=example_ids,
+                    gold_doc_ids=gold_document_ids,
                     documents=(
                         baseline_documents if config_name == "clara_baseline" else None
                     ),
@@ -495,11 +506,6 @@ def run_counterfactual(
                     ),
                     clara_candidate_page_ids=(
                         baseline_candidate_page_ids
-                        if config_name == "clara_baseline"
-                        else None
-                    ),
-                    clara_gold_candidate_indices=(
-                        baseline_gold_candidate_indices
                         if config_name == "clara_baseline"
                         else None
                     ),
@@ -526,7 +532,7 @@ def run_counterfactual(
         "n_checkpoints_per_configuration": len(seeds),
         "seeds": list(seeds),
         "paper_seed_protocol": set(seeds) == PAPER_TRAINING_SEEDS and len(seeds) == 5,
-        "answer_alias_contract": EVALUATION_ANSWER_ALIAS_CONTRACT,
+        "answer_contract": EVALUATION_ANSWER_CONTRACT,
         "clara_archive_sha256": dict(_REPOSITORY_EVAL_ARCHIVE_SHA256),
         "checkpoints": {
             name: [path for _, path in pairs]
@@ -584,7 +590,7 @@ def _cross_benchmark_result(
         "dataset": "avg",
         "compression_rate": compression_rate,
         "benchmark_averaging": "unweighted_within_checkpoint_then_seed_std",
-        "answer_alias_contract": EVALUATION_ANSWER_ALIAS_CONTRACT,
+        "answer_contract": EVALUATION_ANSWER_CONTRACT,
         "clara_archive_sha256": dict(_REPOSITORY_EVAL_ARCHIVE_SHA256),
         "seeds": list(seeds),
         "checkpoints": {
@@ -655,7 +661,7 @@ def main() -> None:
         "--eval_data_path",
         type=str,
         required=True,
-        help="Alias-complete DatasetDict created by `aria-data --stage eval`",
+        help="Scalar-answer DatasetDict created by `aria-data --stage eval`",
     )
     parser.add_argument(
         "--clara_archive_dir",

@@ -1,10 +1,9 @@
-"""Deterministic MuSiQue partial-chain completion protocol.
+"""Generic deterministic MuSiQue prerequisite-prefix utility.
 
-Appendix A.33 reports 70,845 partial chains, but its stated ``k-1`` prefix
-rule yields only ``52,107 - 19,938 = 32,169`` rows when the reported
-subquestion total is used. This module keeps every such prefix and defines the
-remaining rows as non-leaking partial reasoning states. It never duplicates a
-state merely to hit the published count.
+This optional utility enumerates annotated prerequisite prefixes and unresolved
+subsequent-hop frontiers without exposing the final answer. It is not the
+builder for the paper's historical 70,845-row derived artifact; paper data
+preparation consumes and verifies the artifact-owner-supplied source directly.
 """
 
 from __future__ import annotations
@@ -16,10 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
-MUSIQUE_PARTIAL_CHAIN_PROTOCOL = "deterministic-partial-state-v2"
-MUSIQUE_PARTIAL_CHAIN_TARGET = 70_845
-MUSIQUE_ORIGINAL_COUNT = 19_938
-MUSIQUE_SUBQUESTION_COUNT = 52_107
+MUSIQUE_PARTIAL_CHAIN_PROTOCOL = "generic-prefix-frontier-v1"
 
 
 def _required_text(value: Any, *, location: str) -> str:
@@ -161,18 +157,14 @@ def _normalize_parent(
 
 
 def _enumerate_parent_states(parent: MuSiQueParent) -> List[PartialChainState]:
-    """Enumerate every legal state; the last-hop answer is never known."""
-    prerequisite_count = len(parent.hops) - 1
+    """Enumerate strict prerequisite prefixes and their later frontiers."""
     states: List[PartialChainState] = []
-    for mask in range(1, 1 << prerequisite_count):
-        known = tuple(
-            index for index in range(prerequisite_count) if mask & (1 << index)
-        )
-        mandatory = known == tuple(range(len(known)))
+    for prefix_length in range(1, len(parent.hops)):
+        known = tuple(range(prefix_length))
         state_id = musique_partial_state_id(
             parent.parent_id,
             len(parent.hops),
-            "evidence_subset",
+            "evidence_prefix",
             known,
             None,
         )
@@ -180,19 +172,17 @@ def _enumerate_parent_states(parent: MuSiQueParent) -> List[PartialChainState]:
             PartialChainState(
                 parent_id=parent.parent_id,
                 hop_count=len(parent.hops),
-                kind="evidence_subset",
+                kind="evidence_prefix",
                 known_hop_indices=known,
                 frontier_hop_index=None,
-                mandatory_prefix=mandatory,
+                mandatory_prefix=True,
                 state_id=state_id,
             )
         )
         # A frontier exposes only a hop question and the literal <MISSING>
         # marker. Its answer, especially the final-hop answer, never enters the
         # prompt or the known evidence set.
-        for frontier in range(len(parent.hops)):
-            if frontier in known:
-                continue
+        for frontier in range(prefix_length, len(parent.hops)):
             frontier_id = musique_partial_state_id(
                 parent.parent_id,
                 len(parent.hops),
@@ -217,9 +207,9 @@ def _enumerate_parent_states(parent: MuSiQueParent) -> List[PartialChainState]:
 def select_musique_partial_states(
     rows: Sequence[Mapping[str, Any]],
     *,
-    target_count: int = MUSIQUE_PARTIAL_CHAIN_TARGET,
-    expected_original_count: Optional[int] = MUSIQUE_ORIGINAL_COUNT,
-    expected_subquestion_count: Optional[int] = MUSIQUE_SUBQUESTION_COUNT,
+    target_count: int,
+    expected_original_count: Optional[int] = None,
+    expected_subquestion_count: Optional[int] = None,
     parent_id_key: str = "source_row_id",
     question_key: str = "question",
     answer_key: str = "answer",
@@ -314,7 +304,7 @@ def select_musique_partial_states(
         "mandatory_prefix_count": len(mandatory),
         "optional_selected_count": target_count - len(mandatory),
         "legal_state_capacity": capacity,
-        "selection": "mandatory_prefixes_plus_parent_round_robin_state_sha256",
+        "selection": "all_prefixes_plus_parent_round_robin_frontier_state_sha256",
         "selected_state_ids_sha256": hashlib.sha256(
             ("\n".join(state_ids) + "\n").encode("utf-8")
         ).hexdigest(),
@@ -332,10 +322,12 @@ def render_musique_partial_prompt(
         for index in state.known_hop_indices
     ):
         raise ValueError("Known evidence may contain prerequisite hops only")
+    if state.known_hop_indices != tuple(range(len(state.known_hop_indices))):
+        raise ValueError("Known evidence must be a strict prerequisite prefix")
     if state.frontier_hop_index is not None and (
         state.frontier_hop_index < 0
         or state.frontier_hop_index >= len(parent.hops)
-        or state.frontier_hop_index in state.known_hop_indices
+        or state.frontier_hop_index < len(state.known_hop_indices)
     ):
         raise ValueError("Partial frontier must be one unknown valid hop")
 
@@ -442,19 +434,21 @@ def validate_musique_partial_metadata(row: Mapping[str, Any]) -> None:
         raise ValueError("partial_hop_count must be 2, 3, or 4")
     if any(index < 0 or index >= hop_count - 1 for index in known):
         raise ValueError("partial known evidence cannot include the final-hop answer")
+    if list(known) != list(range(len(known))):
+        raise ValueError("partial known evidence must be a strict prerequisite prefix")
     kind = row.get("partial_state_kind")
     frontier_raw = row.get("partial_frontier_hop_index")
     frontier = None if frontier_raw == -1 else frontier_raw
-    if kind not in {"evidence_subset", "missing_frontier"}:
+    if kind not in {"evidence_prefix", "missing_frontier"}:
         raise ValueError("partial_state_kind is invalid")
-    if kind == "evidence_subset" and frontier is not None:
-        raise ValueError("evidence_subset states cannot have a frontier")
+    if kind == "evidence_prefix" and frontier is not None:
+        raise ValueError("evidence_prefix states cannot have a frontier")
     if kind == "missing_frontier" and (
         isinstance(frontier, bool)
         or not isinstance(frontier, int)
         or frontier < 0
         or frontier >= hop_count
-        or frontier in known
+        or frontier < len(known)
     ):
         raise ValueError("missing_frontier states require one unknown hop")
     expected_id = musique_partial_state_id(

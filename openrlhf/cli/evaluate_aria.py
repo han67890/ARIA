@@ -37,6 +37,7 @@ Examples:
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -54,6 +55,7 @@ import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from tqdm import tqdm
 
+from openrlhf.cli.aria_data import PAPER_PHASE2_EPOCH_SEEDS
 from openrlhf.models.modeling_aria import (
     ARIA_NO_COMPRESSION_CONFIGURATION,
     ARIA_NO_COMPRESSION_CONTEXT_CEILING,
@@ -72,7 +74,10 @@ from openrlhf.models.modeling_aria import (
     CFRS_RECONSTRUCTION_SCHEME,
     MATCHED_EVIDENCE_TOKEN_BUDGET,
     MTFRL_INITIALIZATION_SCHEME,
+    ORACLE_QCA_PROTOCOL,
     ORACLE_TOP100_PROTOCOL,
+    OraclePoolRecord,
+    QuestionType,
     QR_INPUT_SCHEME,
     RAG_CONFIGURATION_SPECS,
     RAGPipelineConfig,
@@ -80,14 +85,19 @@ from openrlhf.models.modeling_aria import (
     STATIC_SECOND_QUERY_SCHEME,
     UNIFORM_BUDGET_ALLOCATION_SCHEME,
     _BM25Index,
+    _SemanticAgent,
+    _base_decoder_only,
+    _chunked_inner_product_topk_unique_pages,
+    _construct_oracle_top100_indices,
     create_paper_rag_config,
     _page_deduplicate_ranked_indices,
     required_checkpoint_configuration,
     _tensor_is_finite_in_chunks,
 )
+
 from openrlhf.utils.aria_provenance import (
     CORPUS_SHA256_SCHEME,
-    EVALUATION_ANSWER_ALIAS_CONTRACT,
+    EVALUATION_ANSWER_CONTRACT,
     EVALUATION_GOLD_DOCUMENT_CONTRACT,
     SOURCE_SNAPSHOT_SCHEME,
     TEXT_SHA256_SCHEME,
@@ -98,6 +108,29 @@ from openrlhf.utils.aria_provenance import (
     file_sha256,
     text_sha256 as _shared_text_sha256,
 )
+
+PAPER_QCA_LLM_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
+QCA_LLM_PROTOCOL = "zero-shot-base-mistral-label-only-v1"
+QCA_LLM_PROMPT_VERSION = "qca-three-label-zero-shot-v1"
+QCA_LLM_MAX_NEW_TOKENS = 64
+QCA_LLM_PROMPT_TEMPLATE = """[INST] Classify the question into exactly one query-complexity label.
+
+Labels:
+- simple: a direct question that can be answered without combining multiple facts or comparing multiple aspects.
+- multi-aspect: a question asking for multiple attributes, criteria, entities, or parallel aspects, without requiring a reasoning chain across facts.
+- multi-hop: a question that requires connecting two or more facts in sequence to reach the answer.
+
+Do not answer the question. Return exactly a first line in the form
+Label: <simple|multi-aspect|multi-hop>
+followed by a second line in the form
+Rationale: <brief explanation>
+
+Question: {question}
+[/INST]"""
+QCA_LLM_PROMPT_SHA256 = hashlib.sha256(
+    QCA_LLM_PROMPT_TEMPLATE.encode("utf-8")
+).hexdigest()
+
 # ---------------------------------------------------------------------------
 # Evaluation metrics (Appendix A.35)
 # ---------------------------------------------------------------------------
@@ -293,20 +326,17 @@ _REPOSITORY_BGE_CANDIDATE_COUNT = 20
 _PAPER_NORMAL_TOP_K = 5
 PAPER_COMPRESSION_RATES = {4, 16, 32, 64, 128}
 PAPER_TRAINING_SEEDS = {42, 123, 456, 789, 2024}
+ORACLE_QCA_PANEL_COUNTS: Mapping[str, int] = {
+    "nq": 225,
+    "hotpotqa": 257,
+    "musique": 84,
+    "2wikimultihopqa": 434,
+}
 PAPER_MAX_NEW_TOKENS = 64
 PAPER_BGE_MODEL = "BAAI/bge-large-en-v1.5"
+ORACLE_QUERY_EMBEDDING_PROTOCOL = "frozen-bge-direct-query-cls-l2-v1"
 # Backward-compatible public spelling retained for downstream callers.
 EVALUATION_GOLD_CONTRACT = EVALUATION_GOLD_DOCUMENT_CONTRACT
-_ANSWER_ALIAS_FIELDS = (
-    "gold_answers",
-    "answers",
-    "answer_aliases",
-    "aliases",
-    "normalized_aliases",
-    "acceptable_answers",
-)
-
-
 _REPOSITORY_DOCUMENT_HEADER = re.compile(
     r"^This is a document about\s+(.+?)\s*(?:\r?\n|$)"
 )
@@ -404,10 +434,10 @@ def _load_repository_eval_rows(
 ) -> List[Dict[str, Any]]:
     """Read fingerprinted candidate rows from an external pinned archive.
 
-    The archives contain ranked BGE top-20 candidate lists but no benchmark
-    alias sets. Full ARIA ignores them and performs full-corpus retrieval;
+    The archives contain ranked BGE top-20 candidate lists. Full ARIA ignores
+    them and performs full-corpus retrieval;
     matched CLaRa applies its learned hard-forward/soft-backward top-5 selector
-    to all retained candidates after an alias-complete split is exactly joined.
+    to all retained candidates after the prepared split is exactly joined.
     """
     _, member_name = _REPOSITORY_EVAL_ARCHIVES[dataset_name]
     archive_path = _validate_clara_archive_dir(clara_archive_dir)[dataset_name]
@@ -497,9 +527,6 @@ def _load_repository_eval_rows(
                         ).encode("utf-8")
                     )
                     positives_hasher.update(b"\n")
-                for alias_key in _ANSWER_ALIAS_FIELDS:
-                    if record.get(alias_key) is not None:
-                        row[alias_key] = record[alias_key]
                 rows.append(row)
     if documents_hasher.hexdigest() != _REPOSITORY_BGE_CANDIDATES_SHA256[dataset_name]:
         raise ValueError(
@@ -515,50 +542,19 @@ def _load_repository_eval_rows(
     return rows
 
 
-def _validate_paper_answer_alias_contract(
+def _validate_paper_answer_contract(
     dataset: Any,
     *,
     dataset_name: str,
     answer_key: str,
 ) -> None:
-    """Require one explicit benchmark-provided alias list on every row.
-
-    The external upstream-derived archives have only a scalar ``answer``. Treating
-    that scalar as a complete alias set would silently change Appendix A.35's
-    max-over-aliases metric, so those archives are candidate artifacts only.
-    """
+    """Require the old-paper scalar reference answer on every prepared row."""
     for index, item in enumerate(dataset):
-        raw_aliases = item.get(EVALUATION_ANSWER_ALIAS_CONTRACT["field"])
-        if (
-            not isinstance(raw_aliases, Sequence)
-            or isinstance(raw_aliases, (str, bytes, bytearray))
-            or not raw_aliases
-        ):
+        answer = item.get(answer_key)
+        if not isinstance(answer, str) or not answer.strip():
             raise ValueError(
                 f"Paper-protocol {dataset_name} row {index} requires an explicit "
-                "non-empty gold_answers list of benchmark-provided aliases. The "
-                "external *_no_pos archives contain only scalar answers and may be "
-                "used only for their retained CLaRa candidates; pass an "
-                "--eval_data_path artifact produced by `aria-data --stage eval`."
-            )
-        aliases: List[str] = []
-        for alias_index, alias in enumerate(raw_aliases):
-            if not isinstance(alias, str) or not alias.strip():
-                raise ValueError(
-                    f"Paper-protocol {dataset_name} row {index}.gold_answers"
-                    f"[{alias_index}] must be a non-empty benchmark-provided string"
-                )
-            aliases.append(alias)
-        if len(aliases) != len(set(aliases)):
-            raise ValueError(
-                f"Paper-protocol {dataset_name} row {index}.gold_answers must "
-                "not contain duplicate aliases"
-            )
-        primary_answers = QAMetrics.gold_answers(item.get(answer_key))
-        if not primary_answers or any(answer not in aliases for answer in primary_answers):
-            raise ValueError(
-                f"Paper-protocol {dataset_name} row {index}.gold_answers must "
-                "include every benchmark-provided primary answer"
+                f"non-empty scalar {answer_key!r} reference answer"
             )
 
 
@@ -569,7 +565,7 @@ def _merge_repository_candidates(
     dataset_name: str,
     question_key: str,
 ) -> List[Dict[str, Any]]:
-    """Attach fingerprinted CLaRa candidates to an alias-complete split.
+    """Attach fingerprinted CLaRa candidates to the prepared evaluation split.
 
     The two artifacts are joined only by exact official row order and exact
     question text.  No fuzzy matching or inferred alias mapping is permitted.
@@ -579,12 +575,7 @@ def _merge_repository_candidates(
             f"Prepared {dataset_name} split and external candidate archive must "
             f"have equal counts, got {len(dataset)} and {len(repository_rows)}"
         )
-    candidate_fields = (
-        "docs",
-        "clara_candidate_doc_ids",
-        "clara_candidate_page_ids",
-        "clara_gold_candidate_indices",
-    )
+    candidate_fields = ("docs",)
     merged: List[Dict[str, Any]] = []
     for index, (item, repository_row) in enumerate(zip(dataset, repository_rows)):
         if item.get(question_key) != repository_row.get("question"):
@@ -605,12 +596,9 @@ def _merge_repository_candidates(
 
 def _extract_clara_candidate_columns(
     dataset: Sequence[Mapping[str, Any]],
-) -> Tuple[List[List[str]], List[List[str]], List[List[str]], List[List[int]]]:
-    """Materialize the validated external CLaRa candidate columns."""
+) -> List[List[str]]:
+    """Materialize the validated external CLaRa candidate text columns."""
     documents_by_row: List[List[str]] = []
-    document_ids_by_row: List[List[str]] = []
-    page_ids_by_row: List[List[str]] = []
-    positive_indices_by_row: List[List[int]] = []
     for row_index, item in enumerate(dataset):
         documents = item.get("docs")
         if (
@@ -621,29 +609,54 @@ def _extract_clara_candidate_columns(
                 "CLaRa baseline requires the complete external BGE top-20 pool; "
                 f"row {row_index} has no valid docs field"
             )
-        document_ids = item.get("clara_candidate_doc_ids")
-        page_ids = item.get("clara_candidate_page_ids")
-        positive_indices = item.get("clara_gold_candidate_indices")
-        if not (
-            isinstance(document_ids, list)
-            and isinstance(page_ids, list)
-            and isinstance(positive_indices, list)
-            and len(document_ids) == len(documents)
-            and len(page_ids) == len(documents)
-        ):
-            raise ValueError(
-                f"CLaRa row {row_index} lacks stable external-archive candidate identities"
-            )
         documents_by_row.append(documents)
-        document_ids_by_row.append(document_ids)
-        page_ids_by_row.append(page_ids)
-        positive_indices_by_row.append(positive_indices)
-    return (
-        documents_by_row,
-        document_ids_by_row,
-        page_ids_by_row,
-        positive_indices_by_row,
-    )
+    return documents_by_row
+
+
+def _map_clara_candidates_to_corpus(
+    documents_by_row: Sequence[Sequence[str]],
+    *,
+    corpus_docs: Sequence[str],
+    corpus_ids: Sequence[str],
+    corpus_page_ids: Sequence[str],
+) -> Tuple[List[List[str]], List[List[str]], List[List[int]]]:
+    """Map archived candidate text to unique full-corpus document/page identities.
+
+    Exact outer-stripped text is the join key. Missing or ambiguous matches fail
+    closed because archive-local positions cannot define corpus-level Recall@5.
+    """
+    if not (
+        len(corpus_docs) == len(corpus_ids) == len(corpus_page_ids)
+        and corpus_docs
+    ):
+        raise ValueError("CLaRa candidate mapping requires an aligned non-empty corpus")
+    indices_by_text_hash: Dict[str, List[int]] = defaultdict(list)
+    for corpus_index, document in enumerate(corpus_docs):
+        indices_by_text_hash[_text_sha256(document)].append(corpus_index)
+
+    mapped_doc_ids: List[List[str]] = []
+    mapped_page_ids: List[List[str]] = []
+    mapped_indices: List[List[int]] = []
+    for row_index, documents in enumerate(documents_by_row):
+        row_indices: List[int] = []
+        for candidate_index, document in enumerate(documents):
+            candidates = indices_by_text_hash.get(_text_sha256(document), [])
+            exact = [
+                index
+                for index in candidates
+                if corpus_docs[index].strip() == document.strip()
+            ]
+            if len(exact) != 1:
+                reason = "missing" if not exact else "ambiguous"
+                raise ValueError(
+                    "CLaRa archive candidate cannot be mapped uniquely to the full "
+                    f"corpus ({reason}) at row {row_index}, candidate {candidate_index}"
+                )
+            row_indices.append(exact[0])
+        mapped_indices.append(row_indices)
+        mapped_doc_ids.append([corpus_ids[index] for index in row_indices])
+        mapped_page_ids.append([corpus_page_ids[index] for index in row_indices])
+    return mapped_doc_ids, mapped_page_ids, mapped_indices
 
 
 def load_eval_dataset(
@@ -653,14 +666,13 @@ def load_eval_dataset(
     require_clara_archive: bool = False,
     clara_archive_dir: Optional[str] = None,
 ):
-    """Load an alias-complete paper split and optional external CLaRa candidates."""
+    """Load a scalar-answer paper split and optional external CLaRa candidates."""
     cfg = DATASET_CONFIGS[dataset_name]
     dataset = None
     if eval_data_path is None:
         raise ValueError(
-            "Paper-protocol answer metrics require --eval_data_path with explicit "
-            "benchmark-provided gold_answers lists. External *_no_pos archives "
-            "contain scalar answers only and are CLaRa candidate artifacts."
+            "Paper-protocol answer metrics require --eval_data_path with one "
+            "explicit scalar benchmark answer per row."
         )
     prepared_path = Path(os.path.expanduser(eval_data_path))
     manifest_path = prepared_path / "aria_manifest.json"
@@ -678,10 +690,9 @@ def load_eval_dataset(
             "gold_doc_ids covering all annotated positives independently of its "
             "candidate list"
         )
-    if manifest.get("answer_alias_contract") != EVALUATION_ANSWER_ALIAS_CONTRACT:
+    if manifest.get("answer_contract") != EVALUATION_ANSWER_CONTRACT:
         raise ValueError(
-            "--eval_data_path must be regenerated with an explicit non-empty "
-            "gold_answers list of benchmark-provided aliases on every row"
+            "--eval_data_path must be regenerated with the scalar-answer paper contract"
         )
     prepared = load_from_disk(str(prepared_path))
     if isinstance(prepared, Mapping):
@@ -722,7 +733,7 @@ def load_eval_dataset(
             f"Official {dataset_name} evaluation split must contain exactly "
             f"{EVALUATION_COUNTS[dataset_name]:,} rows, got {len(dataset):,}"
         )
-    _validate_paper_answer_alias_contract(
+    _validate_paper_answer_contract(
         dataset,
         dataset_name=dataset_name,
         answer_key=cfg["answer_key"],
@@ -783,13 +794,318 @@ def _extract_example_ids(dataset: Any, dataset_name: str) -> List[str]:
     return ids
 
 
-def _extract_gold_answers(item: Mapping[str, Any], answer_key: str) -> List[str]:
-    """Collect the primary answer and any dataset-provided answer aliases."""
-    values: List[Any] = [item[answer_key]]
-    for alias_key in _ANSWER_ALIAS_FIELDS:
-        if alias_key in item and item[alias_key] is not None:
-            values.append(item[alias_key])
-    return list(dict.fromkeys(QAMetrics.gold_answers(values)))
+def _load_oracle_qca_labels(path: str) -> Dict[str, str]:
+    """Load explicit example-ID-to-QCA-label annotations from JSON or JSONL."""
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Oracle-QCA label artifact does not exist: {resolved}")
+
+    def unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Oracle-QCA JSON contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    records: List[Tuple[Any, Any]] = []
+    if resolved.suffix.casefold() == ".jsonl":
+        with resolved.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line, object_pairs_hook=unique_object)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid Oracle-QCA JSONL row {line_number}: {exc}"
+                    ) from exc
+                if not isinstance(row, Mapping):
+                    raise ValueError(
+                        f"Oracle-QCA JSONL row {line_number} must be an object"
+                    )
+                if "example_id" not in row or "question_type" not in row:
+                    raise ValueError(
+                        "Oracle-QCA JSONL rows require example_id and question_type"
+                    )
+                records.append((row["example_id"], row["question_type"]))
+    else:
+        with resolved.open("r", encoding="utf-8") as handle:
+            try:
+                payload = json.load(handle, object_pairs_hook=unique_object)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(f"Invalid Oracle-QCA JSON artifact: {exc}") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError(
+                "Oracle-QCA JSON must map example_id directly to question_type"
+            )
+        records = list(payload.items())
+
+    labels: Dict[str, str] = {}
+    for raw_example_id, raw_type in records:
+        if not isinstance(raw_example_id, str) or not raw_example_id.strip():
+            raise ValueError("Oracle-QCA example_id values must be non-empty strings")
+        example_id = raw_example_id.strip()
+        if example_id in labels:
+            raise ValueError(f"Duplicate Oracle-QCA example_id {example_id!r}")
+        try:
+            question_type = QuestionType(raw_type).value
+        except (TypeError, ValueError) as exc:
+            allowed = ", ".join(value.value for value in QuestionType)
+            raise ValueError(
+                f"Oracle-QCA label for {example_id!r} must be one of {allowed}; "
+                f"got {raw_type!r}"
+            ) from exc
+        labels[example_id] = question_type
+    if not labels:
+        raise ValueError("Oracle-QCA label artifact must contain at least one label")
+    return labels
+
+
+def _oracle_qca_labeled_subset(
+    example_ids: Sequence[Hashable],
+    labels: Mapping[str, str],
+    *,
+    dataset_name: str,
+) -> Tuple[List[int], List[str]]:
+    """Return the dataset rows with explicit labels, retaining dataset order."""
+    indices: List[int] = []
+    reference_types: List[str] = []
+    for index, raw_example_id in enumerate(example_ids):
+        example_id = str(raw_example_id)
+        if example_id in labels:
+            indices.append(index)
+            reference_types.append(labels[example_id])
+    if not indices:
+        raise ValueError(
+            f"Oracle-QCA labels do not match any {dataset_name} evaluation example_id"
+        )
+    return indices, reference_types
+
+
+def _validate_oracle_qca_paper_panel(
+    dataset_name: str,
+    matched_example_ids: Sequence[Hashable],
+) -> None:
+    expected_count = ORACLE_QCA_PANEL_COUNTS[dataset_name]
+    if len(matched_example_ids) != expected_count:
+        raise ValueError(
+            f"Oracle-QCA requires exactly {expected_count} labeled {dataset_name} "
+            f"examples; matched {len(matched_example_ids)}"
+        )
+
+
+def _validate_oracle_qca_conditions(
+    *,
+    retrieval_mode: str,
+    rag_configuration: str,
+    compression_rate: int,
+    max_samples: Optional[int] = None,
+    dataset: Optional[str] = None,
+) -> None:
+    """Fail closed outside the paper's Normal/full/16x Oracle-QCA endpoint."""
+    if retrieval_mode != "normal":
+        raise ValueError("Oracle-QCA requires --retrieval_mode normal")
+    if rag_configuration != "full":
+        raise ValueError("Oracle-QCA requires --rag_configuration full")
+    if compression_rate != 16:
+        raise ValueError("Oracle-QCA requires --compression_rate 16")
+    if max_samples is not None:
+        raise ValueError("Oracle-QCA cannot be combined with --max_samples")
+    if dataset is not None and dataset != "all":
+        raise ValueError("Oracle-QCA paper endpoint requires --dataset all")
+
+
+def _validate_qca_llm_conditions(
+    *,
+    retrieval_mode: str,
+    rag_configuration: str,
+    compression_rate: int,
+    dataset: str,
+    max_samples: Optional[int],
+) -> None:
+    """Fail closed outside the paper's Mistral QCA sensitivity setting."""
+    if retrieval_mode != "normal":
+        raise ValueError("QCA-LLM requires --retrieval_mode normal")
+    if rag_configuration != "full":
+        raise ValueError("QCA-LLM requires --rag_configuration full")
+    if compression_rate != 16:
+        raise ValueError("QCA-LLM requires --compression_rate 16")
+    if dataset != "all":
+        raise ValueError("QCA-LLM paper endpoints require --dataset all")
+    if max_samples is not None:
+        raise ValueError("QCA-LLM cannot be combined with --max_samples")
+
+
+def _qca_llm_prompt(question: str) -> str:
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("QCA-LLM requires a non-empty question")
+    return QCA_LLM_PROMPT_TEMPLATE.format(question=question.strip())
+
+
+def _parse_qca_llm_output(raw_output: str) -> Tuple[str, str]:
+    """Parse the strict two-line zero-shot router response."""
+    if not isinstance(raw_output, str) or not raw_output.strip():
+        raise ValueError("QCA-LLM returned an empty response")
+    lines = raw_output.strip().splitlines()
+    match = re.fullmatch(
+        r"Label:\s*(simple|multi[-_]aspect|multi[-_]hop)\s*",
+        lines[0],
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError(
+            "QCA-LLM first line must be exactly 'Label: <class>'"
+        )
+    if len(lines) < 2 or not lines[1].startswith("Rationale:"):
+        raise ValueError("QCA-LLM second line must start with 'Rationale:'")
+    rationale = "\n".join(
+        [lines[1][len("Rationale:") :].strip(), *lines[2:]]
+    ).strip()
+    if not rationale:
+        raise ValueError("QCA-LLM rationale must be non-empty")
+    parsed = match.group(1).casefold().replace("-", "_")
+    return QuestionType(parsed).value, rationale
+
+
+def _run_qca_llm_router(
+    model: CLaRa,
+    questions: Sequence[str],
+    *,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
+    """Run the zero-shot base decoder once and return auditable route records."""
+    if model.decoder_model_name != PAPER_QCA_LLM_MODEL:
+        raise ValueError(
+            f"QCA-LLM requires base model {PAPER_QCA_LLM_MODEL!r}"
+        )
+    revision = getattr(
+        model.config, "decoder_model_resolved_revision", None
+    )
+    if not isinstance(revision, str) or re.fullmatch(
+        r"[0-9a-fA-F]{40}", revision
+    ) is None:
+        raise ValueError("QCA-LLM requires an exact resolved base-model revision")
+    if batch_size <= 0:
+        raise ValueError("QCA-LLM batch_size must be positive")
+    prompts = [_qca_llm_prompt(question) for question in questions]
+    records: List[Dict[str, Any]] = []
+    decoder = model.decoder
+    tokenizer = model.decoder_tokenizer
+    parameter = next(decoder.parameters(), None)
+    device = parameter.device if parameter is not None else torch.device("cpu")
+    context_limit = int(
+        getattr(getattr(decoder, "config", None), "max_position_embeddings", 32_768)
+    )
+    if context_limit <= QCA_LLM_MAX_NEW_TOKENS:
+        raise ValueError("QCA-LLM decoder context cannot reserve 64 output tokens")
+
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[start : start + batch_size]
+        encoded = tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding="longest",
+            add_special_tokens=False,
+            truncation=False,
+        )
+        if "input_ids" not in encoded or "attention_mask" not in encoded:
+            raise RuntimeError("QCA-LLM tokenizer omitted input IDs or attention mask")
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+        prompt_lengths = attention_mask.sum(dim=1)
+        if torch.any(prompt_lengths > context_limit - QCA_LLM_MAX_NEW_TOKENS):
+            raise ValueError("QCA-LLM prompt exceeds the reserved decoder context")
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        with torch.inference_mode(), _base_decoder_only(decoder):
+            output_ids = decoder.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                do_sample=False,
+                top_p=None,
+                temperature=None,
+                max_new_tokens=QCA_LLM_MAX_NEW_TOKENS,
+                num_beams=1,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        prompt_width = input_ids.size(1)
+        if output_ids.ndim != 2 or output_ids.shape[0] != len(batch_prompts):
+            raise RuntimeError("QCA-LLM decoder returned malformed token IDs")
+        raw_outputs = tokenizer.batch_decode(
+            output_ids[:, prompt_width:], skip_special_tokens=True
+        )
+        if len(raw_outputs) != len(batch_prompts):
+            raise RuntimeError("QCA-LLM decoder output count does not match prompts")
+        latency_ms = elapsed_ms / len(batch_prompts)
+        for local_index, (prompt, raw_output) in enumerate(
+            zip(batch_prompts, raw_outputs)
+        ):
+            parsed_type, rationale = _parse_qca_llm_output(raw_output)
+            records.append(
+                {
+                    "protocol": QCA_LLM_PROTOCOL,
+                    "question": questions[start + local_index],
+                    "prompt": prompt,
+                    "prompt_version": QCA_LLM_PROMPT_VERSION,
+                    "prompt_template_sha256": QCA_LLM_PROMPT_SHA256,
+                    "prompt_sha256": hashlib.sha256(
+                        prompt.encode("utf-8")
+                    ).hexdigest(),
+                    "raw_output": raw_output,
+                    "parsed_type": parsed_type,
+                    "rationale": rationale,
+                    "latency_ms": latency_ms,
+                    "base_model": model.decoder_model_name,
+                    "base_model_revision_resolved": revision.lower(),
+                    "adapters_disabled": True,
+                    "decoding": "greedy-eos-or-64",
+                }
+            )
+    return records
+
+
+def _qca_weighted_f1(
+    reference_types: Sequence[str], predicted_types: Sequence[str]
+) -> float:
+    if not reference_types or len(reference_types) != len(predicted_types):
+        raise ValueError("QCA weighted F1 requires aligned non-empty labels")
+    labels = [value.value for value in QuestionType]
+    if any(value not in labels for value in (*reference_types, *predicted_types)):
+        raise ValueError("QCA weighted F1 received an invalid label")
+    total = len(reference_types)
+    weighted = 0.0
+    for label in labels:
+        true_positive = sum(
+            reference == label and predicted == label
+            for reference, predicted in zip(reference_types, predicted_types)
+        )
+        false_positive = sum(
+            reference != label and predicted == label
+            for reference, predicted in zip(reference_types, predicted_types)
+        )
+        false_negative = sum(
+            reference == label and predicted != label
+            for reference, predicted in zip(reference_types, predicted_types)
+        )
+        support = true_positive + false_negative
+        denominator = 2 * true_positive + false_positive + false_negative
+        f1 = 0.0 if denominator == 0 else 2 * true_positive / denominator
+        weighted += support * f1
+    return weighted / total
+
+
+def _extract_gold_answer(item: Mapping[str, Any], answer_key: str) -> str:
+    """Read the prepared split's single old-paper reference answer."""
+    answer = item.get(answer_key)
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError(f"Evaluation row requires a non-empty scalar {answer_key!r}")
+    return answer
 
 
 def _extract_gold_document_ids(dataset: Any) -> Optional[List[List[str]]]:
@@ -830,6 +1146,128 @@ def _extract_gold_document_ids(dataset: Any) -> Optional[List[List[str]]]:
             "Evaluation gold_doc_ids must be supplied for every row or omitted for every row"
         )
     return [value for value in extracted if value is not None]
+
+
+def _bge_encoder_spec_from_artifact(artifact: Any) -> Dict[str, Any]:
+    """Resolve the immutable encoder used to build a v2 BGE corpus index."""
+    if not isinstance(artifact, Mapping) or artifact.get("artifact_format") != (
+        "aria-bge-artifact-v2"
+    ):
+        raise ValueError(
+            "Oracle pool construction requires a v2 BGE artifact with verified "
+            "encoder provenance"
+        )
+    if artifact.get("bge_model") != PAPER_BGE_MODEL:
+        raise ValueError(f"Oracle requires bge_model={PAPER_BGE_MODEL!r}")
+    source = artifact.get("encoder_source")
+    kind = artifact.get("encoder_source_kind")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("Oracle BGE artifact requires encoder_source")
+    if kind == "huggingface-hub":
+        revision = artifact.get("encoder_revision_resolved")
+        if source != PAPER_BGE_MODEL or not isinstance(revision, str) or re.fullmatch(
+            r"[0-9a-fA-F]{40}", revision
+        ) is None:
+            raise ValueError(
+                "Oracle BGE Hub provenance requires the paper model and an exact commit"
+            )
+        return {
+            "source": source,
+            "source_kind": kind,
+            "revision": revision.lower(),
+            "source_sha256": None,
+        }
+    if kind == "local-directory":
+        source_sha256 = artifact.get("encoder_source_sha256")
+        if not isinstance(source_sha256, str) or re.fullmatch(
+            r"[0-9a-f]{64}", source_sha256
+        ) is None:
+            raise ValueError("Oracle local BGE provenance requires a directory SHA-256")
+        if not Path(source).expanduser().is_dir():
+            raise FileNotFoundError(
+                f"Oracle BGE encoder directory is unavailable: {source}"
+            )
+        return {
+            "source": str(Path(source).expanduser().resolve()),
+            "source_kind": kind,
+            "revision": None,
+            "source_sha256": source_sha256,
+        }
+    raise ValueError("Oracle BGE artifact has an unsupported encoder_source_kind")
+
+
+def _encode_oracle_queries(
+    questions: Sequence[str], encoder_spec: Mapping[str, Any]
+) -> torch.Tensor:
+    """Encode questions once with the same frozen BGE encoder as the corpus."""
+    if not questions or any(not isinstance(value, str) or not value.strip() for value in questions):
+        raise ValueError("Oracle BGE query encoding requires non-empty questions")
+    agent = _SemanticAgent(
+        str(encoder_spec["source"]),
+        encoder_spec.get("revision"),
+    )
+    embeddings = torch.from_numpy(agent._embed(list(questions))).float()
+    if embeddings.ndim != 2 or embeddings.shape[1] != 1024:
+        raise RuntimeError("Oracle BGE queries must have shape (batch, 1024)")
+    if not torch.isfinite(embeddings).all().item():
+        raise RuntimeError("Oracle BGE query embeddings contain non-finite values")
+    return torch.nn.functional.normalize(embeddings, dim=-1, eps=1e-12)
+
+
+def _build_shared_oracle_pool_records(
+    query_embeddings: torch.Tensor,
+    doc_embeddings: torch.Tensor,
+    *,
+    corpus_ids: Sequence[str],
+    corpus_page_ids: Sequence[str],
+    gold_doc_ids: Sequence[Sequence[str]],
+) -> List[OraclePoolRecord]:
+    """Build the page-unique top-100 pool shared by ARIA and CLaRa."""
+    if query_embeddings.ndim != 2 or query_embeddings.shape[0] != len(gold_doc_ids):
+        raise ValueError("Oracle query embeddings must align with gold_doc_ids")
+    if not (
+        doc_embeddings.ndim == 2
+        and len(corpus_ids) == len(corpus_page_ids) == doc_embeddings.shape[0]
+    ):
+        raise ValueError("Oracle corpus identities and embeddings must align")
+    if len(set(corpus_page_ids)) < 100:
+        raise ValueError("Oracle top-100 requires at least 100 unique corpus pages")
+    corpus_id_to_index = {document_id: index for index, document_id in enumerate(corpus_ids)}
+    if len(corpus_id_to_index) != len(corpus_ids):
+        raise ValueError("Oracle corpus document IDs must be unique")
+    normalized_documents = torch.nn.functional.normalize(
+        doc_embeddings.detach().float().cpu(), dim=-1, eps=1e-12
+    )
+    base_rows = _chunked_inner_product_topk_unique_pages(
+        torch.nn.functional.normalize(
+            query_embeddings.detach().float().cpu(), dim=-1, eps=1e-12
+        ),
+        normalized_documents,
+        corpus_page_ids,
+        100,
+    )
+    records: List[OraclePoolRecord] = []
+    for row_index, document_ids in enumerate(gold_doc_ids):
+        representative_by_page: Dict[str, int] = {}
+        for document_id in document_ids:
+            if document_id not in corpus_id_to_index:
+                raise ValueError(
+                    f"Oracle gold_doc_ids[{row_index}] contains an unknown corpus ID"
+                )
+            corpus_index = corpus_id_to_index[document_id]
+            representative_by_page.setdefault(corpus_page_ids[corpus_index], corpus_index)
+        if not representative_by_page:
+            raise ValueError(
+                f"Oracle gold_doc_ids[{row_index}] must contain at least one support"
+            )
+        records.append(
+            _construct_oracle_top100_indices(
+                base_rows[row_index].tolist(),
+                list(representative_by_page.values()),
+                corpus_page_ids=corpus_page_ids,
+            )
+        )
+    return records
 
 
 def _corpus_text(item: Mapping[str, Any]) -> str:
@@ -939,6 +1377,7 @@ def load_doc_embeddings(
     *,
     expected_page_ids: Optional[Sequence[str]] = None,
     return_index_sha256: bool = False,
+    return_encoder_spec: bool = False,
 ) -> Any:
     """Load and validate the dense BGE corpus matrix used by AHR and MTFRL."""
     artifact = _load_artifact(path)
@@ -1028,8 +1467,12 @@ def load_doc_embeddings(
         and computed_index_sha256 != expected_index_sha256
     ):
         raise ValueError("doc_embeddings do not match the explicitly expected BGE index")
+    if return_index_sha256 and return_encoder_spec:
+        return embeddings, computed_index_sha256, _bge_encoder_spec_from_artifact(artifact)
     if return_index_sha256:
         return embeddings, computed_index_sha256
+    if return_encoder_spec:
+        return embeddings, _bge_encoder_spec_from_artifact(artifact)
     return embeddings
 
 
@@ -1151,6 +1594,9 @@ class ARIAEvaluator:
         self.use_rag_pipeline = use_rag_pipeline
         self.retrieval_mode = retrieval_mode
         self.no_compression = bool(no_compression)
+        self.corpus_docs = list(corpus_docs)
+        self.doc_embeddings = doc_embeddings
+        self.rag_config: Optional[RAGPipelineConfig] = None
         self.no_compression_context_limit = (
             model._resolve_no_compression_context_limit()
             if self.no_compression
@@ -1168,13 +1614,45 @@ class ARIAEvaluator:
             if self.corpus_ids is not None
             else None
         )
-        if retrieval_mode == "oracle" and (
-            not use_rag_pipeline
+        if self.corpus_ids is not None and len(self.corpus_ids) != len(self.corpus_docs):
+            raise ValueError("corpus_ids must be aligned one-to-one with corpus_docs")
+        if self.corpus_page_ids is not None and len(self.corpus_page_ids) != len(
+            self.corpus_docs
+        ):
+            raise ValueError("corpus_page_ids must be aligned one-to-one with corpus_docs")
+        if self.corpus_ids is not None and len(set(self.corpus_ids)) != len(self.corpus_ids):
+            raise ValueError("corpus_ids must be unique")
+        if self.corpus_page_ids is not None and any(
+            not isinstance(page_id, str) or not page_id.strip()
+            for page_id in self.corpus_page_ids
+        ):
+            raise ValueError("corpus_page_ids must contain non-empty strings")
+        if not use_rag_pipeline and (
+            not self.corpus_docs
             or self.corpus_ids is None
             or not self._has_explicit_page_ids
         ):
             raise ValueError(
-                "Oracle evaluation requires full RAG, stable corpus IDs, and page IDs"
+                "CLaRa evaluation requires the full corpus and stable document/page IDs"
+            )
+        if retrieval_mode == "oracle" and (
+            not self.corpus_docs
+            or self.corpus_ids is None
+            or not self._has_explicit_page_ids
+            or doc_embeddings is None
+        ):
+            raise ValueError(
+                "Oracle evaluation requires the full corpus, aligned BGE embeddings, "
+                "and stable document/page IDs"
+            )
+        if retrieval_mode == "oracle" and not use_rag_pipeline and (
+            doc_embeddings is None
+            or doc_embeddings.ndim != 2
+            or doc_embeddings.shape != (len(self.corpus_docs), 1024)
+            or not _tensor_is_finite_in_chunks(doc_embeddings)
+        ):
+            raise ValueError(
+                "CLaRa Oracle requires finite (corpus_size, 1024) BGE embeddings"
             )
 
         if use_rag_pipeline:
@@ -1189,20 +1667,10 @@ class ARIAEvaluator:
                 raise ValueError(
                     "doc_embeddings must be a 2-D matrix aligned one-to-one with corpus_docs"
                 )
-            if self.corpus_ids is not None and len(self.corpus_ids) != len(corpus_docs):
-                raise ValueError(
-                    "corpus_ids must be aligned one-to-one with corpus_docs"
-                )
             if self.corpus_ids is not None and len(set(self.corpus_ids)) != len(
                 self.corpus_ids
             ):
                 raise ValueError("corpus_ids must be unique")
-            if self.corpus_page_ids is not None and len(self.corpus_page_ids) != len(
-                corpus_docs
-            ):
-                raise ValueError(
-                    "corpus_page_ids must be aligned one-to-one with corpus_docs"
-                )
             if self.corpus_page_ids is not None and any(
                 not isinstance(page_id, str) or not page_id.strip()
                 for page_id in self.corpus_page_ids
@@ -1235,6 +1703,7 @@ class ARIAEvaluator:
                 ccef_filter_threshold=0.30,
                 compression_rate=getattr(model, "compr_rate", None),
             )
+            self.rag_config = cfg
             if self.no_compression and (
                 not all(
                     (cfg.use_qca, cfg.use_ahr, cfg.use_igfr, cfg.use_mads, cfg.use_ccef)
@@ -1278,22 +1747,150 @@ class ARIAEvaluator:
     def evaluate(
         self,
         questions: List[str],
-        gold_answers: List[Any],
+        gold_answers: List[str],
         example_ids: Optional[List[Hashable]] = None,
         gold_doc_ids: Optional[List[List[str]]] = None,
         documents: Optional[List[List[str]]] = None,
         clara_candidate_doc_ids: Optional[List[List[str]]] = None,
         clara_candidate_page_ids: Optional[List[List[str]]] = None,
-        clara_gold_candidate_indices: Optional[List[List[int]]] = None,
+        oracle_pool_records: Optional[Sequence[OraclePoolRecord]] = None,
+        qca_reference_types: Optional[List[str]] = None,
+        qca_llm_records: Optional[Sequence[Mapping[str, Any]]] = None,
         batch_size: int = 8,
         max_new_tokens: int = PAPER_MAX_NEW_TOKENS,
     ) -> Dict[str, Any]:
         """Evaluate one checkpoint and retain identity-aligned per-example scores."""
         if len(questions) != len(gold_answers):
             raise ValueError("questions and gold_answers must have equal length")
+        if any(not isinstance(answer, str) or not answer.strip() for answer in gold_answers):
+            raise ValueError(
+                "Paper-protocol evaluation requires one non-empty scalar gold answer "
+                "per question"
+            )
+        if qca_reference_types is not None and qca_llm_records is not None:
+            raise ValueError("Oracle-QCA and QCA-LLM overrides are mutually exclusive")
+        normalized_qca_reference_types: Optional[List[str]] = None
+        qca_override_protocol: Optional[str] = None
+        validated_qca_llm_records: Optional[List[Mapping[str, Any]]] = None
+        raw_override_types: Optional[Sequence[str]] = qca_reference_types
+        if qca_llm_records is not None:
+            if len(qca_llm_records) != len(questions):
+                raise ValueError(
+                    "qca_llm_records must be aligned one-to-one with questions"
+                )
+            validated_qca_llm_records = list(qca_llm_records)
+            raw_override_types = []
+            for index, (question, record) in enumerate(
+                zip(questions, validated_qca_llm_records)
+            ):
+                if not isinstance(record, Mapping):
+                    raise ValueError(f"qca_llm_records[{index}] must be an object")
+                expected_prompt = _qca_llm_prompt(question)
+                if (
+                    record.get("protocol") != QCA_LLM_PROTOCOL
+                    or record.get("question") != question
+                    or record.get("prompt") != expected_prompt
+                    or record.get("prompt_version") != QCA_LLM_PROMPT_VERSION
+                    or record.get("prompt_template_sha256")
+                    != QCA_LLM_PROMPT_SHA256
+                    or record.get("prompt_sha256")
+                    != hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest()
+                    or record.get("adapters_disabled") is not True
+                    or record.get("decoding") != "greedy-eos-or-64"
+                    or record.get("base_model") != self.model.decoder_model_name
+                    or record.get("base_model_revision_resolved")
+                    != str(
+                        getattr(
+                            self.model.config,
+                            "decoder_model_resolved_revision",
+                            "",
+                        )
+                    ).lower()
+                ):
+                    raise ValueError(
+                        f"qca_llm_records[{index}] violates the prompt/protocol contract"
+                    )
+                parsed_type, rationale = _parse_qca_llm_output(
+                    record.get("raw_output")
+                )
+                if (
+                    record.get("parsed_type") != parsed_type
+                    or record.get("rationale") != rationale
+                ):
+                    raise ValueError(
+                        f"qca_llm_records[{index}] does not match its raw output"
+                    )
+                latency = record.get("latency_ms")
+                if (
+                    isinstance(latency, bool)
+                    or not isinstance(latency, (int, float))
+                    or not math.isfinite(float(latency))
+                    or float(latency) < 0.0
+                ):
+                    raise ValueError(
+                        f"qca_llm_records[{index}].latency_ms must be finite and non-negative"
+                    )
+                raw_override_types.append(parsed_type)
+            qca_override_protocol = QCA_LLM_PROTOCOL
+        elif qca_reference_types is not None:
+            if len(qca_reference_types) != len(questions):
+                raise ValueError(
+                    "qca_reference_types must be aligned one-to-one with questions"
+                )
+            qca_override_protocol = ORACLE_QCA_PROTOCOL
+
+        if raw_override_types is not None:
+            model_configuration = getattr(
+                getattr(self.model, "config", None),
+                "aria_rag_configuration",
+                None,
+            )
+            model_compression_rate = getattr(self.model, "compr_rate", None)
+            if (
+                isinstance(model_compression_rate, bool)
+                or not isinstance(model_compression_rate, int)
+            ):
+                model_compression_rate = 0
+            _validate_oracle_qca_conditions(
+                retrieval_mode=self.retrieval_mode,
+                rag_configuration=model_configuration,
+                compression_rate=model_compression_rate,
+            )
+            cfg = self.rag_config
+            if (
+                not self.use_rag_pipeline
+                or self.no_compression
+                or cfg is None
+                or not all(
+                    (
+                        cfg.use_qca,
+                        cfg.use_ahr,
+                        cfg.use_igfr,
+                        cfg.use_mads,
+                        cfg.use_ccef,
+                        cfg.use_cfrs,
+                        cfg.use_acr,
+                        cfg.use_mtfrl,
+                    )
+                )
+                or cfg.acr_allocation_mode != "adaptive"
+                or cfg.second_retrieval_mode != "memory_feedback"
+                or cfg.compression_rate != 16
+            ):
+                raise ValueError(
+                    "QCA label-only overrides require the complete full-ARIA "
+                    "runtime at 16x"
+                )
+            try:
+                normalized_qca_reference_types = [
+                    QuestionType(value).value for value in raw_override_types
+                ]
+            except (TypeError, ValueError) as exc:
+                allowed = ", ".join(value.value for value in QuestionType)
+                raise ValueError(
+                    f"qca_reference_types must contain only {allowed}"
+                ) from exc
         if gold_doc_ids is not None:
-            if not self.use_rag_pipeline:
-                raise ValueError("Recall@5 requires full-corpus RAG evaluation")
             if self.corpus_ids is None:
                 raise ValueError("Recall@5 requires stable corpus_ids")
             if not self._has_explicit_page_ids or self.corpus_page_ids is None:
@@ -1340,99 +1937,125 @@ class ARIAEvaluator:
             raise ValueError(
                 "Oracle evaluation requires corpus-level gold_doc_ids for every question"
             )
+        fixed_oracle_pool_records = (
+            list(oracle_pool_records) if oracle_pool_records is not None else None
+        )
+        if fixed_oracle_pool_records is not None:
+            if self.retrieval_mode != "oracle":
+                raise ValueError("oracle_pool_records are valid only for Oracle retrieval")
+            if len(fixed_oracle_pool_records) != len(questions):
+                raise ValueError("oracle_pool_records must align one-to-one with questions")
+            for row_index, record in enumerate(fixed_oracle_pool_records):
+                if (
+                    not isinstance(record, OraclePoolRecord)
+                    or record.protocol != ORACLE_TOP100_PROTOCOL
+                    or len(record.pool_indices) != 100
+                    or len(record.pool_page_ids) != 100
+                    or len(set(record.pool_page_ids)) != 100
+                    or any(
+                        index < 0 or index >= len(self.corpus_docs)
+                        for index in record.pool_indices
+                    )
+                ):
+                    raise ValueError(
+                        f"oracle_pool_records[{row_index}] violates the shared top-100 contract"
+                    )
         if self.use_rag_pipeline and documents is not None:
             raise ValueError(
                 "Paper-protocol evaluation must retrieve from the full KILT corpus; "
                 "pre-retrieved documents cannot be supplied"
             )
+        if not self.use_rag_pipeline and self.retrieval_mode == "oracle":
+            if fixed_oracle_pool_records is None:
+                raise ValueError(
+                    "CLaRa Oracle evaluation requires the shared fixed pool records"
+                )
+            if any(
+                value is not None
+                for value in (documents, clara_candidate_doc_ids, clara_candidate_page_ids)
+            ):
+                raise ValueError(
+                    "CLaRa Oracle candidates are materialized only from the shared pool"
+                )
+            if self.corpus_ids is None or self.corpus_page_ids is None:
+                raise RuntimeError("CLaRa Oracle corpus identities are unavailable")
+            documents = [
+                [self.corpus_docs[index] for index in record.pool_indices]
+                for record in fixed_oracle_pool_records
+            ]
+            clara_candidate_doc_ids = [
+                [self.corpus_ids[index] for index in record.pool_indices]
+                for record in fixed_oracle_pool_records
+            ]
+            clara_candidate_page_ids = [
+                [self.corpus_page_ids[index] for index in record.pool_indices]
+                for record in fixed_oracle_pool_records
+            ]
         if documents is not None and len(documents) != len(questions):
             raise ValueError("documents must be aligned one-to-one with questions")
         clara_metadata = (
             clara_candidate_doc_ids,
             clara_candidate_page_ids,
-            clara_gold_candidate_indices,
         )
         if any(value is not None for value in clara_metadata) and not all(
             value is not None for value in clara_metadata
         ):
             raise ValueError(
-                "CLaRa Recall@5 requires candidate document IDs, page IDs, and "
-                "positive indices together"
+                "CLaRa evaluation requires candidate document IDs and page IDs together"
             )
-        clara_gold_page_ids: Optional[List[List[str]]] = None
-        if all(value is not None for value in clara_metadata):
-            if self.use_rag_pipeline or documents is None or gold_doc_ids is not None:
-                raise ValueError(
-                    "Archive-local CLaRa recall metadata is valid only for the "
-                    "matched non-RAG candidate path"
-                )
+        clara_recall_enabled = not self.use_rag_pipeline
+        clara_retrieval_provenance: Optional[Dict[str, Any]] = None
+        if clara_recall_enabled:
             if (
-                clara_candidate_doc_ids is None
+                documents is None
+                or clara_candidate_doc_ids is None
                 or clara_candidate_page_ids is None
-                or clara_gold_candidate_indices is None
+                or gold_doc_ids is None
             ):
-                raise RuntimeError("CLaRa recall metadata validation is inconsistent")
+                raise ValueError(
+                    "CLaRa paper evaluation requires mapped corpus candidates and "
+                    "prepared corpus-level gold_doc_ids"
+                )
+            if self._corpus_id_to_index is None or self.corpus_page_ids is None:
+                raise RuntimeError("CLaRa full-corpus identity mapping is unavailable")
+            expected_candidate_count = (
+                100
+                if self.retrieval_mode == "oracle"
+                else _REPOSITORY_BGE_CANDIDATE_COUNT
+            )
             if not (
                 len(clara_candidate_doc_ids)
                 == len(clara_candidate_page_ids)
-                == len(clara_gold_candidate_indices)
                 == len(documents)
                 == len(questions)
             ):
-                raise ValueError("CLaRa recall metadata must align one-to-one with questions")
-            clara_gold_page_ids = []
-            for row_index, (
-                row_documents,
-                row_doc_ids,
-                row_page_ids,
-                row_positive_indices,
-            ) in enumerate(
-                zip(
-                    documents,
-                    clara_candidate_doc_ids,
-                    clara_candidate_page_ids,
-                    clara_gold_candidate_indices,
-                )
+                raise ValueError("CLaRa candidate metadata must align with questions")
+            for row_index, (row_documents, row_doc_ids, row_page_ids) in enumerate(
+                zip(documents, clara_candidate_doc_ids, clara_candidate_page_ids)
             ):
                 if not (
                     len(row_documents)
                     == len(row_doc_ids)
                     == len(row_page_ids)
-                    == _REPOSITORY_BGE_CANDIDATE_COUNT
+                    == expected_candidate_count
                 ):
                     raise ValueError(
-                        f"CLaRa recall row {row_index} must align exactly 20 candidates"
+                        f"CLaRa row {row_index} must align exactly "
+                        f"{expected_candidate_count} candidates"
                     )
-                if any(not isinstance(value, str) or not value for value in row_doc_ids):
-                    raise ValueError("CLaRa candidate document IDs must be non-empty strings")
-                if any(not isinstance(value, str) or not value for value in row_page_ids):
-                    raise ValueError("CLaRa candidate page IDs must be non-empty strings")
-                if any(
-                    isinstance(value, bool)
-                    or not isinstance(value, int)
-                    or value < 0
-                    or value >= len(row_documents)
-                    for value in row_positive_indices
-                ) or len(row_positive_indices) != len(set(row_positive_indices)):
-                    raise ValueError(
-                        f"CLaRa positive indices are invalid at row {row_index}"
-                    )
-                clara_gold_page_ids.append(
-                    list(
-                        dict.fromkeys(
-                            row_page_ids[value] for value in row_positive_indices
+                for candidate_index, (document, document_id, page_id) in enumerate(
+                    zip(row_documents, row_doc_ids, row_page_ids)
+                ):
+                    corpus_index = self._corpus_id_to_index.get(document_id)
+                    if (
+                        corpus_index is None
+                        or self.corpus_docs[corpus_index].strip() != document.strip()
+                        or self.corpus_page_ids[corpus_index] != page_id
+                    ):
+                        raise ValueError(
+                            "CLaRa candidate lacks a reliable full-corpus identity at "
+                            f"row {row_index}, candidate {candidate_index}"
                         )
-                    )
-                )
-        clara_recall_enabled = clara_gold_page_ids is not None
-        clara_retrieval_provenance: Optional[Dict[str, Any]] = None
-        if clara_recall_enabled:
-            if (
-                clara_candidate_doc_ids is None
-                or clara_candidate_page_ids is None
-                or clara_gold_candidate_indices is None
-            ):
-                raise RuntimeError("CLaRa provenance metadata is unexpectedly absent")
 
             def _ordered_rows_sha256(rows: Sequence[Sequence[Any]]) -> str:
                 hasher = hashlib.sha256()
@@ -1448,18 +2071,28 @@ class ARIAEvaluator:
                 return hasher.hexdigest()
 
             clara_retrieval_provenance = {
-                "protocol": CLARA_EVALUATION_CANDIDATE_PROTOCOL,
-                "release_convention": True,
-                "paper_specification_scope": (
-                    "paper-specifies-st-top-k-but-not-a-unique-candidate-pool-size"
+                "protocol": (
+                    ORACLE_TOP100_PROTOCOL
+                    if self.retrieval_mode == "oracle"
+                    else CLARA_EVALUATION_CANDIDATE_PROTOCOL
                 ),
-                "candidate_source": "retained-repository-bge-top20",
-                "candidate_count": _REPOSITORY_BGE_CANDIDATE_COUNT,
+                "retrieval_mode": self.retrieval_mode,
+                "candidate_source": (
+                    "shared-oracle-bge-top100"
+                    if self.retrieval_mode == "oracle"
+                    else "retained-repository-bge-top20"
+                ),
+                "candidate_count": expected_candidate_count,
                 "hard_selection_count": int(self.model.generation_top_k),
-                "document_id_scheme": CLARA_ARCHIVE_DOCUMENT_ID_SCHEME,
-                "page_id_scheme": CLARA_ARCHIVE_PAGE_ID_SCHEME,
+                "candidate_identity_join": (
+                    "shared-oracle-corpus-index-v1"
+                    if self.retrieval_mode == "oracle"
+                    else "exact-corpus-text-unique-v1"
+                ),
+                "document_id_scope": "full-kilt-corpus",
+                "page_id_scheme": "canonical-page-url-v1",
                 "page_deduplicated_recall": True,
-                "support_scope": "Q_sup",
+                "support_scope": "prepared-full-corpus-Q_sup",
                 "example_count": len(questions),
                 "candidate_document_order_sha256": _ordered_rows_sha256(
                     clara_candidate_doc_ids
@@ -1467,14 +2100,88 @@ class ARIAEvaluator:
                 "candidate_page_order_sha256": _ordered_rows_sha256(
                     clara_candidate_page_ids
                 ),
-                "positive_indices_sha256": _ordered_rows_sha256(
-                    clara_gold_candidate_indices
-                ),
             }
         if example_ids is None:
             example_ids = list(range(len(questions)))
         if len(example_ids) != len(questions):
             raise ValueError("example_ids must be aligned one-to-one with questions")
+        oracle_qca_provenance: Optional[Dict[str, Any]] = None
+        qca_llm_provenance: Optional[Dict[str, Any]] = None
+        if (
+            normalized_qca_reference_types is not None
+            and qca_override_protocol == ORACLE_QCA_PROTOCOL
+        ):
+            panel_hasher = hashlib.sha256()
+            for example_id, question_type in zip(
+                example_ids, normalized_qca_reference_types
+            ):
+                panel_hasher.update(
+                    json.dumps(
+                        [str(example_id), question_type],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                panel_hasher.update(b"\n")
+            oracle_qca_provenance = {
+                "protocol": ORACLE_QCA_PROTOCOL,
+                "scope": "evaluation-only-labeled-subset",
+                "retrieval_mode": "normal",
+                "rag_configuration": "full",
+                "compression_rate": 16,
+                "labeled_example_count": len(normalized_qca_reference_types),
+                "label_counts": dict(Counter(normalized_qca_reference_types)),
+                "labeled_panel_sha256": panel_hasher.hexdigest(),
+                "preserved_surface_fields": [
+                    "confidence",
+                    "matched_rules",
+                    "hop_count",
+                    "sub_questions",
+                    "entity_count",
+                ],
+            }
+        if validated_qca_llm_records is not None:
+            revisions = {
+                str(record.get("base_model_revision_resolved"))
+                for record in validated_qca_llm_records
+            }
+            models = {
+                str(record.get("base_model"))
+                for record in validated_qca_llm_records
+            }
+            if models != {PAPER_QCA_LLM_MODEL} or len(revisions) != 1:
+                raise ValueError(
+                    "QCA-LLM records must share one exact Mistral base revision"
+                )
+            qca_llm_provenance = {
+                "protocol": QCA_LLM_PROTOCOL,
+                "endpoint": "full-benchmark-qa-label-only-override",
+                "retrieval_mode": "normal",
+                "rag_configuration": "full",
+                "compression_rate": 16,
+                "example_count": len(validated_qca_llm_records),
+                "prompt_version": QCA_LLM_PROMPT_VERSION,
+                "prompt_template_sha256": QCA_LLM_PROMPT_SHA256,
+                "base_model": PAPER_QCA_LLM_MODEL,
+                "base_model_revision_resolved": next(iter(revisions)),
+                "adapters_disabled": True,
+                "decoding": "greedy-eos-or-64",
+                "mean_router_latency_ms": float(
+                    np.mean(
+                        [
+                            float(record.get("latency_ms"))
+                            for record in validated_qca_llm_records
+                        ]
+                    )
+                ),
+                "preserved_surface_fields": [
+                    "confidence",
+                    "matched_rules",
+                    "hop_count",
+                    "sub_questions",
+                    "entity_count",
+                ],
+            }
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if max_new_tokens != PAPER_MAX_NEW_TOKENS:
@@ -1498,7 +2205,7 @@ class ARIAEvaluator:
                 "context_policy": ARIA_NO_COMPRESSION_CONTEXT_POLICY,
                 "protocol_context_ceiling": ARIA_NO_COMPRESSION_CONTEXT_CEILING,
                 "effective_context_ceiling": self.no_compression_context_limit,
-                "passage_truncation": "right-only-if-32k-context-would-overflow",
+                "passage_truncation": "evidence-tail-only; system-and-question-preserved",
                 "decoding": "greedy-one-beam-eos-or-64",
             }
             if self.no_compression
@@ -1560,6 +2267,12 @@ class ARIAEvaluator:
                 )
                 if self.no_compression:
                     generation_kwargs["no_compression"] = True
+                if normalized_qca_reference_types is not None:
+                    generation_kwargs["qca_reference_types"] = (
+                        normalized_qca_reference_types[
+                            start : start + len(batch_questions)
+                        ]
+                    )
                 if self.retrieval_mode == "oracle":
                     if (
                         self._corpus_id_to_index is None
@@ -1581,6 +2294,12 @@ class ARIAEvaluator:
                         generation_kwargs["oracle_gold_indices"].append(
                             [representative_by_page[page_id] for page_id in page_row]
                         )
+                    if fixed_oracle_pool_records is not None:
+                        generation_kwargs["oracle_pool_records"] = (
+                            fixed_oracle_pool_records[
+                                start : start + len(batch_questions)
+                            ]
+                        )
                 pred_texts, retrieved_indices = self.model.generate_from_questions(
                     **generation_kwargs
                 )
@@ -1601,6 +2320,13 @@ class ARIAEvaluator:
                         f"example; got {len(batch_diagnostics)} for "
                         f"{len(batch_questions)} examples"
                     )
+            if (
+                normalized_qca_reference_types is not None
+                and batch_diagnostics is None
+            ):
+                raise RuntimeError(
+                    "Oracle-QCA evaluation requires per-example QCA diagnostics"
+                )
 
             batch_retrieved_ids: Optional[List[List[str]]] = None
             batch_retrieved_page_ids: Optional[List[List[str]]] = None
@@ -1649,13 +2375,22 @@ class ARIAEvaluator:
                             f"at batch row {row_index}"
                         )
                     batch_first_pass_corpus_indices.append(index_row)
-            oracle_pool_records: Optional[List[Any]] = None
+            batch_oracle_pool_records: Optional[List[Any]] = None
             if self.retrieval_mode == "oracle":
-                getter = getattr(self.model, "get_oracle_pool_records", None)
-                if getter is None:
-                    raise RuntimeError("Oracle model must expose its constructed pool records")
-                oracle_pool_records = getter()
-                if len(oracle_pool_records) != len(batch_questions):
+                if clara_recall_enabled:
+                    if fixed_oracle_pool_records is None:
+                        raise RuntimeError("CLaRa Oracle pool records are unavailable")
+                    batch_oracle_pool_records = fixed_oracle_pool_records[
+                        start : start + len(batch_questions)
+                    ]
+                else:
+                    getter = getattr(self.model, "get_oracle_pool_records", None)
+                    if getter is None:
+                        raise RuntimeError(
+                            "Oracle model must expose its constructed pool records"
+                        )
+                    batch_oracle_pool_records = getter()
+                if len(batch_oracle_pool_records) != len(batch_questions):
                     raise RuntimeError(
                         "Oracle evaluation requires one pool record per question"
                     )
@@ -1716,7 +2451,7 @@ class ARIAEvaluator:
                     batch_retrieved_page_ids.append(
                         [batch_candidate_page_ids[row_index][value] for value in deduplicated]
                     )
-            if gold_doc_ids is not None:
+            if gold_doc_ids is not None and not clara_recall_enabled:
                 if isinstance(retrieved_indices, torch.Tensor):
                     if retrieved_indices.ndim != 2:
                         raise RuntimeError(
@@ -1806,14 +2541,14 @@ class ARIAEvaluator:
 
             for offset, prediction in enumerate(pred_texts):
                 index = start + offset
-                golds = QAMetrics.gold_answers(gold_answers[index])
-                metrics = QAMetrics.compute_all(prediction, golds)
+                gold = gold_answers[index]
+                metrics = QAMetrics.compute_all(prediction, gold)
                 all_metrics.append(metrics)
                 prediction_record: Dict[str, Any] = {
                     "example_id": str(example_ids[index]),
                     "question": batch_questions[offset],
                     "prediction": str(prediction),
-                    "gold_answers": golds,
+                    "gold_answer": gold,
                     **metrics,
                 }
                 if self.no_compression:
@@ -1826,6 +2561,51 @@ class ARIAEvaluator:
                     )
                 if batch_diagnostics is not None:
                     diagnostic = batch_diagnostics[offset]
+                    if normalized_qca_reference_types is not None:
+                        rule_type = str(
+                            getattr(diagnostic, "rule_question_type", "")
+                        )
+                        overridden_type = str(
+                            getattr(diagnostic, "oracle_question_type", "")
+                        )
+                        expected_type = normalized_qca_reference_types[index]
+                        if rule_type not in {value.value for value in QuestionType}:
+                            raise RuntimeError(
+                                "Oracle-QCA diagnostics omitted the surface rule type"
+                            )
+                        if overridden_type != expected_type:
+                            raise RuntimeError(
+                                "QCA override diagnostics do not match the routed type"
+                            )
+                        prediction_record.update({
+                            "qca_override_protocol": qca_override_protocol,
+                            "qca_rule_type": rule_type,
+                        })
+                        if qca_override_protocol == ORACLE_QCA_PROTOCOL:
+                            prediction_record["qca_oracle_type"] = overridden_type
+                        elif qca_override_protocol == QCA_LLM_PROTOCOL:
+                            if validated_qca_llm_records is None:
+                                raise RuntimeError(
+                                    "QCA-LLM route provenance is unavailable"
+                                )
+                            record = validated_qca_llm_records[index]
+                            prediction_record.update(
+                                {
+                                    "qca_llm_type": overridden_type,
+                                    "qca_llm_prompt": record["prompt"],
+                                    "qca_llm_prompt_version": record[
+                                        "prompt_version"
+                                    ],
+                                    "qca_llm_prompt_sha256": record[
+                                        "prompt_sha256"
+                                    ],
+                                    "qca_llm_raw_output": record["raw_output"],
+                                    "qca_llm_rationale": record["rationale"],
+                                    "qca_llm_latency_ms": float(
+                                        record["latency_ms"]
+                                    ),
+                                }
+                            )
                     if self.no_compression:
                         document_tokens = int(
                             getattr(diagnostic, "direct_context_document_tokens", 0)
@@ -1906,9 +2686,9 @@ class ARIAEvaluator:
                             retrieval_recalls[cutoff].append(recall)
                             prediction_record[f"recall_at_{cutoff}"] = recall
                     if self.retrieval_mode == "oracle":
-                        if oracle_pool_records is None or self.corpus_ids is None:
+                        if batch_oracle_pool_records is None or self.corpus_ids is None:
                             raise RuntimeError("Oracle pool provenance was not materialized")
-                        pool_record = oracle_pool_records[offset]
+                        pool_record = batch_oracle_pool_records[offset]
                         pool_ids = [
                             self.corpus_ids[value]
                             for value in pool_record.pool_indices
@@ -1949,44 +2729,6 @@ class ARIAEvaluator:
                                 ],
                             }
                         )
-                elif clara_recall_enabled:
-                    if (
-                        batch_retrieved_ids is None
-                        or batch_retrieved_page_ids is None
-                        or clara_gold_candidate_indices is None
-                        or clara_gold_page_ids is None
-                        or clara_candidate_doc_ids is None
-                    ):
-                        raise RuntimeError(
-                            "CLaRa Recall@5 identities were not materialized"
-                        )
-                    retrieved_ids = batch_retrieved_ids[offset]
-                    retrieved_pages = batch_retrieved_page_ids[offset]
-                    positive_indices = clara_gold_candidate_indices[index]
-                    gold_ids = list(
-                        dict.fromkeys(
-                            clara_candidate_doc_ids[index][value]
-                            for value in positive_indices
-                        )
-                    )
-                    gold_pages = clara_gold_page_ids[index]
-                    prediction_record.update(
-                        {
-                            "clara_candidate_count": _REPOSITORY_BGE_CANDIDATE_COUNT,
-                            "clara_gold_candidate_indices": positive_indices,
-                            "gold_doc_ids": gold_ids,
-                            "gold_page_ids": gold_pages,
-                            "retrieved_doc_ids": retrieved_ids,
-                            "retrieved_page_ids": retrieved_pages,
-                            "has_gold_support": bool(gold_pages),
-                        }
-                    )
-                    if gold_pages:
-                        recall = len(
-                            set(retrieved_pages[:5]) & set(gold_pages)
-                        ) / len(set(gold_pages))
-                        retrieval_recalls[5].append(recall)
-                        prediction_record["recall_at_5"] = recall
                 predictions.append(prediction_record)
 
         if not all_metrics:
@@ -1997,7 +2739,7 @@ class ARIAEvaluator:
                 "count": 0,
                 "predictions": [],
             }
-            if gold_doc_ids is not None or clara_recall_enabled:
+            if gold_doc_ids is not None:
                 for cutoff in retrieval_cutoffs:
                     empty_result[f"recall_at_{cutoff}"] = 0.0
                 empty_result["recall_at_5_support_count"] = 0
@@ -2007,6 +2749,10 @@ class ARIAEvaluator:
                 )
             if no_compression_protocol is not None:
                 empty_result["no_compression_protocol"] = no_compression_protocol
+            if oracle_qca_provenance is not None:
+                empty_result["oracle_qca_provenance"] = oracle_qca_provenance
+            if qca_llm_provenance is not None:
+                empty_result["qca_llm_provenance"] = qca_llm_provenance
             return empty_result
         result = {
             metric: float(np.mean([row[metric] for row in all_metrics]))
@@ -2036,10 +2782,8 @@ class ARIAEvaluator:
                 np.mean(direct_context_prompt_tokens)
             )
             result["no_compression_protocol"] = no_compression_protocol
-        if gold_doc_ids is not None or clara_recall_enabled:
-            support_page_rows = (
-                gold_page_ids if gold_doc_ids is not None else clara_gold_page_ids
-            ) or []
+        if gold_doc_ids is not None:
+            support_page_rows = gold_page_ids or []
             expected_support_count = sum(bool(page_row) for page_row in support_page_rows)
             if any(
                 len(retrieval_recalls[cutoff]) != expected_support_count
@@ -2054,12 +2798,16 @@ class ARIAEvaluator:
                     )
         if clara_retrieval_provenance is not None:
             result["clara_retrieval_provenance"] = clara_retrieval_provenance
+        if oracle_qca_provenance is not None:
+            result["oracle_qca_provenance"] = oracle_qca_provenance
+        if qca_llm_provenance is not None:
+            result["qca_llm_provenance"] = qca_llm_provenance
         return result
 
     def evaluate_multi_seed(
         self,
         questions: List[str],
-        gold_answers: List[Any],
+        gold_answers: List[str],
         seeds: Optional[List[Optional[int]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -2175,6 +2923,30 @@ def aggregate_checkpoint_results(
                 "All ARIA-NoComp checkpoints must share exact direct-context provenance"
             )
         aggregated["no_compression_protocol"] = no_compression_protocols[0]
+    oracle_qca_provenance = [
+        result.get("oracle_qca_provenance") for result in results
+    ]
+    if any(value is not None for value in oracle_qca_provenance):
+        if any(value is None for value in oracle_qca_provenance) or any(
+            value != oracle_qca_provenance[0]
+            for value in oracle_qca_provenance[1:]
+        ):
+            raise ValueError(
+                "All Oracle-QCA checkpoints must share the same labeled panel"
+            )
+        aggregated["oracle_qca_provenance"] = oracle_qca_provenance[0]
+    qca_llm_provenance = [
+        result.get("qca_llm_provenance") for result in results
+    ]
+    if any(value is not None for value in qca_llm_provenance):
+        if any(value is None for value in qca_llm_provenance) or any(
+            value != qca_llm_provenance[0]
+            for value in qca_llm_provenance[1:]
+        ):
+            raise ValueError(
+                "All QCA-LLM checkpoints must reuse the same cached router records"
+            )
+        aggregated["qca_llm_provenance"] = qca_llm_provenance[0]
     return aggregated
 
 
@@ -2435,7 +3207,7 @@ def compare_evaluation_payloads(
             if len(run_seeds) != len(set(run_seeds)):
                 raise ValueError(f"{label} {dataset_name} contains duplicate seed runs")
             expected_ids: Optional[set[str]] = None
-            canonical_content: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
+            canonical_content: Dict[str, Tuple[str, str]] = {}
             for run in runs:
                 predictions = run.get("predictions", [])
                 ids = {str(prediction.get("example_id")) for prediction in predictions}
@@ -2451,16 +3223,14 @@ def compare_evaluation_payloads(
                     )
                 for prediction in predictions:
                     example_id = str(prediction.get("example_id"))
+                    saved_gold = prediction.get("gold_answer")
+                    if not isinstance(saved_gold, str) or not saved_gold.strip():
+                        raise ValueError(
+                            f"{label} {dataset_name} prediction lacks scalar gold_answer"
+                        )
                     signature = (
                         str(prediction.get("question")),
-                        tuple(
-                            sorted(
-                                QAMetrics.normalize_answer(answer)
-                                for answer in QAMetrics.gold_answers(
-                                    prediction.get("gold_answers", [])
-                                )
-                            )
-                        ),
+                        QAMetrics.normalize_answer(saved_gold),
                     )
                     previous = canonical_content.setdefault(example_id, signature)
                     if previous != signature:
@@ -2506,27 +3276,22 @@ def compare_evaluation_payloads(
         for key in candidate_index:
             candidate_prediction = candidate_index[key]
             baseline_prediction = baseline_index[key]
+            candidate_gold = candidate_prediction.get("gold_answer")
+            baseline_gold = baseline_prediction.get("gold_answer")
+            if (
+                not isinstance(candidate_gold, str)
+                or not candidate_gold.strip()
+                or not isinstance(baseline_gold, str)
+                or not baseline_gold.strip()
+            ):
+                raise ValueError("Saved prediction comparison requires scalar gold_answer")
             candidate_signature = (
                 str(candidate_prediction.get("question")),
-                tuple(
-                    sorted(
-                        QAMetrics.normalize_answer(answer)
-                        for answer in QAMetrics.gold_answers(
-                            candidate_prediction.get("gold_answers", [])
-                        )
-                    )
-                ),
+                QAMetrics.normalize_answer(candidate_gold),
             )
             baseline_signature = (
                 str(baseline_prediction.get("question")),
-                tuple(
-                    sorted(
-                        QAMetrics.normalize_answer(answer)
-                        for answer in QAMetrics.gold_answers(
-                            baseline_prediction.get("gold_answers", [])
-                        )
-                    )
-                ),
+                QAMetrics.normalize_answer(baseline_gold),
             )
             if candidate_signature != baseline_signature:
                 raise ValueError(
@@ -2800,8 +3565,7 @@ def _validate_checkpoint_protocol(
         not isinstance(manifest_digest, str)
         or len(manifest_digest) != 64
         or not isinstance(epoch_schedule, list)
-        or len(epoch_schedule) != 5
-        or len(set(epoch_schedule)) != 5
+        or tuple(epoch_schedule) != PAPER_PHASE2_EPOCH_SEEDS
     ):
         raise ValueError(
             f"Checkpoint {checkpoint_path!r} requires complete Phase-II dataset provenance"
@@ -3230,6 +3994,175 @@ def _cross_benchmark_average(
     )
 
 
+def _evaluate_qca_llm_panel(
+    args: argparse.Namespace,
+    seed_checkpoints: Sequence[Tuple[Optional[int], str]],
+    checkpoint_configs: Sequence[CLaRaConfig],
+) -> None:
+    """Evaluate only the fixed 1,000-example QCA classification endpoint."""
+    if args.qca_llm_labels is None:
+        raise ValueError("QCA-LLM panel mode requires --qca_llm_labels")
+    base_models = {
+        getattr(config, "decoder_model_name", None) for config in checkpoint_configs
+    }
+    revisions = {
+        getattr(config, "decoder_model_resolved_revision", None)
+        for config in checkpoint_configs
+    }
+    if base_models != {PAPER_QCA_LLM_MODEL} or len(revisions) != 1:
+        raise ValueError(
+            "QCA-LLM panel checkpoints must share one exact Mistral-7B base revision"
+        )
+    revision = next(iter(revisions))
+    if not isinstance(revision, str) or re.fullmatch(
+        r"[0-9a-fA-F]{40}", revision
+    ) is None:
+        raise ValueError("QCA-LLM panel requires an exact resolved base revision")
+
+    panel_rows: List[Dict[str, Any]] = []
+    label_sources: Dict[str, Dict[str, Any]] = {}
+    for dataset_name in ORACLE_QCA_PANEL_COUNTS:
+        dataset, question_key, _ = load_eval_dataset(
+            dataset_name,
+            None,
+            args.eval_data_path,
+            require_clara_archive=False,
+        )
+        all_example_ids = _extract_example_ids(dataset, dataset_name)
+        label_path = _format_artifact_path(
+            args.qca_llm_labels,
+            dataset=dataset_name,
+            compression_rate=args.compression_rate,
+        )
+        labels = _load_oracle_qca_labels(label_path)
+        indices, references = _oracle_qca_labeled_subset(
+            all_example_ids,
+            labels,
+            dataset_name=dataset_name,
+        )
+        matched_ids = [all_example_ids[index] for index in indices]
+        _validate_oracle_qca_paper_panel(dataset_name, matched_ids)
+        matched_hasher = hashlib.sha256()
+        for example_id in matched_ids:
+            matched_hasher.update(str(example_id).encode("utf-8"))
+            matched_hasher.update(b"\n")
+        label_sources[dataset_name] = {
+            "source_path": str(Path(label_path).expanduser().resolve()),
+            "source_sha256": file_sha256(Path(label_path)),
+            "source_label_count": len(labels),
+            "matched_label_count": len(matched_ids),
+            "matched_example_ids_sha256": matched_hasher.hexdigest(),
+        }
+        for index, example_id, reference_type in zip(
+            indices, matched_ids, references
+        ):
+            panel_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "example_id": example_id,
+                    "question": dataset[index][question_key],
+                    "reference_type": QuestionType(reference_type).value,
+                }
+            )
+    expected_total = sum(ORACLE_QCA_PANEL_COUNTS.values())
+    if len(panel_rows) != expected_total:
+        raise RuntimeError(
+            f"QCA-LLM panel requires exactly {expected_total} examples"
+        )
+
+    training_seed, checkpoint_path = seed_checkpoints[0]
+    _set_inference_seed(args.inference_seed)
+    model = CLaRa.from_pretrained(
+        checkpoint_path,
+        strict_aria_artifacts=True,
+        external_bge_artifact=args.bge_projection_path is not None,
+        pure_inference=True,
+    )
+    if args.decoder_model is not None and args.decoder_model != model.decoder_model_name:
+        raise ValueError(
+            "--decoder_model must match the backbone recorded by the checkpoint"
+        )
+    protocol_fingerprint = _validate_checkpoint_protocol(
+        model,
+        checkpoint_path,
+        training_seed,
+        args.compression_rate,
+        "full",
+    )
+    model = model.to(args.device)
+    model.eval()
+    records = _run_qca_llm_router(
+        model,
+        [row["question"] for row in panel_rows],
+        batch_size=args.batch_size,
+    )
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    predictions = [record["parsed_type"] for record in records]
+    references_all = [row["reference_type"] for row in panel_rows]
+    per_benchmark: Dict[str, Dict[str, Any]] = {}
+    for dataset_name, expected_count in ORACLE_QCA_PANEL_COUNTS.items():
+        indices = [
+            index
+            for index, row in enumerate(panel_rows)
+            if row["dataset"] == dataset_name
+        ]
+        references = [references_all[index] for index in indices]
+        predicted = [predictions[index] for index in indices]
+        if len(indices) != expected_count:
+            raise RuntimeError("QCA-LLM benchmark panel count changed unexpectedly")
+        per_benchmark[dataset_name] = {
+            "count": expected_count,
+            "weighted_f1": _qca_weighted_f1(references, predicted),
+        }
+
+    output_records = []
+    for row, record in zip(panel_rows, records):
+        output_records.append(
+            {
+                **row,
+                **record,
+                "correct": row["reference_type"] == record["parsed_type"],
+            }
+        )
+    payload = {
+        "metadata": {
+            "protocol": QCA_LLM_PROTOCOL,
+            "endpoint": "fixed-primary-1000-query-classification-panel",
+            "paper_panel_counts": dict(ORACLE_QCA_PANEL_COUNTS),
+            "paper_panel_total": expected_total,
+            "prompt_version": QCA_LLM_PROMPT_VERSION,
+            "prompt_template_sha256": QCA_LLM_PROMPT_SHA256,
+            "base_model": PAPER_QCA_LLM_MODEL,
+            "base_model_revision_resolved": revision.lower(),
+            "adapters_disabled": True,
+            "decoding": "greedy-eos-or-64",
+            "checkpoint_used": str(Path(checkpoint_path).expanduser().resolve()),
+            "training_seed": training_seed,
+            "checkpoint_protocol": protocol_fingerprint,
+            "label_sources": label_sources,
+            "mean_router_latency_ms": float(
+                np.mean([record["latency_ms"] for record in records])
+            ),
+        },
+        "weighted_f1": _qca_weighted_f1(references_all, predictions),
+        "per_benchmark": per_benchmark,
+        "predictions": output_records,
+    }
+    output_path = os.path.join(args.output_dir, "qca_llm_panel.json")
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        json.dump(
+            _json_safe(payload),
+            output_file,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    print(f"QCA-LLM panel results saved to {output_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ARIA End-to-End Evaluation")
     checkpoint_group = parser.add_mutually_exclusive_group(required=True)
@@ -3272,14 +4205,42 @@ def main() -> None:
             "a BGE top-100 pool with missing positives injected at its tail."
         ),
     )
+    parser.add_argument(
+        "--oracle_qca_labels",
+        type=str,
+        default=None,
+        help=(
+            "Evaluation-only JSON mapping example_id to simple, multi_aspect, or "
+            "multi_hop, or JSONL rows with example_id and question_type. Supports "
+            "a {dataset} path template. Only explicitly labeled rows are evaluated."
+        ),
+    )
+    parser.add_argument(
+        "--qca_llm_mode",
+        choices=["qa", "panel"],
+        default=None,
+        help=(
+            "Evaluator-only zero-shot Mistral QCA router. 'qa' runs the full "
+            "four-benchmark QA endpoint; 'panel' reports weighted F1 on the "
+            "fixed 1,000-query primary annotation panel."
+        ),
+    )
+    parser.add_argument(
+        "--qca_llm_labels",
+        type=str,
+        default=None,
+        help=(
+            "Keyed primary QCA labels for --qca_llm_mode panel. Supports a "
+            "{dataset} path template and is not used by the QA endpoint."
+        ),
+    )
     parser.add_argument("--compression_rate", type=int, default=16)
     parser.add_argument(
         "--eval_data_path",
         type=str,
         required=True,
         help=(
-            "Alias-complete DatasetDict created by `aria-data --stage eval`; "
-            "external scalar-answer ZIPs are CLaRa candidate artifacts only"
+            "Scalar-answer DatasetDict created by `aria-data --stage eval`"
         ),
     )
     parser.add_argument(
@@ -3293,8 +4254,8 @@ def main() -> None:
         default=None,
         help=(
             "External directory containing the four pinned CLaRa candidate ZIPs "
-            "(nq.zip, hotpotqa.zip, musique.zip, 2wiki.zip). Required only for "
-            "--rag_configuration clara_baseline; archives are not bundled."
+            "(nq.zip, hotpotqa.zip, musique.zip, 2wiki.zip). Required for matched "
+            "CLaRa Normal evaluation only; archives are not bundled."
         ),
     )
     parser.add_argument(
@@ -3349,9 +4310,9 @@ def main() -> None:
         ),
         default=None,
         help=(
-            "Explicit training/runtime protocol. Use remove_all_coupling for "
-            "the independently retrained 108-token/static-D2 control and "
-            "forward_path_off for the full-checkpoint 184-token/no-D2 intervention. "
+            "Explicit training/runtime protocol. Paper coupling rows use fixed_* "
+            "or forward_path_off on full checkpoints; remove_all_coupling is an "
+            "additional independently retrained 108-token/static-D2 control. "
             "no_compression is the evaluator-only ARIA-NoComp diagnostic: it "
             "requires a full Phase-II checkpoint and Normal retrieval."
         ),
@@ -3397,6 +4358,38 @@ def main() -> None:
             "Select an explicit --rag_configuration, or one supported legacy "
             "fixed-checkpoint switch combination"
         )
+    if args.oracle_qca_labels is not None:
+        try:
+            _validate_oracle_qca_conditions(
+                retrieval_mode=args.retrieval_mode,
+                rag_configuration=expected_configuration,
+                compression_rate=args.compression_rate,
+                max_samples=args.max_samples,
+                dataset=args.dataset,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.qca_llm_mode is not None:
+        if args.oracle_qca_labels is not None:
+            parser.error("QCA-LLM and Oracle-QCA cannot be combined")
+        try:
+            _validate_qca_llm_conditions(
+                retrieval_mode=args.retrieval_mode,
+                rag_configuration=expected_configuration,
+                compression_rate=args.compression_rate,
+                dataset=args.dataset,
+                max_samples=args.max_samples,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.qca_llm_mode == "panel" and args.qca_llm_labels is None:
+            parser.error("--qca_llm_mode panel requires --qca_llm_labels")
+        if args.qca_llm_mode == "qa" and args.qca_llm_labels is not None:
+            parser.error("--qca_llm_labels is valid only in QCA-LLM panel mode")
+        if args.baseline_results is not None and args.qca_llm_mode == "panel":
+            parser.error("QCA-LLM panel mode does not accept --baseline_results")
+    elif args.qca_llm_labels is not None:
+        parser.error("--qca_llm_labels requires --qca_llm_mode panel")
     is_no_compression = (
         expected_configuration == ARIA_NO_COMPRESSION_CONFIGURATION
     )
@@ -3404,19 +4397,20 @@ def main() -> None:
         parser.error("--rag_configuration no_compression requires Normal retrieval")
     is_clara_baseline = expected_configuration == "clara_baseline"
     if is_clara_baseline:
-        if args.clara_archive_dir is None:
+        if args.retrieval_mode == "normal" and args.clara_archive_dir is None:
             parser.error(
-                "--rag_configuration clara_baseline requires --clara_archive_dir"
+                "Normal --rag_configuration clara_baseline requires --clara_archive_dir"
             )
-        if args.retrieval_mode != "normal":
-            parser.error("Matched CLaRa supports only --retrieval_mode normal")
+        if args.retrieval_mode == "oracle" and args.clara_archive_dir is not None:
+            parser.error("CLaRa Oracle uses the shared top-100 pool, not an archive")
     elif args.clara_archive_dir is not None:
         parser.error("--clara_archive_dir is valid only for matched CLaRa evaluation")
-    if not is_clara_baseline and (
-        args.corpus_path is None or args.doc_embeddings is None
+    if (
+        args.qca_llm_mode != "panel"
+        and (args.corpus_path is None or args.doc_embeddings is None)
     ):
         parser.error(
-            "Full-ARIA evaluation requires --corpus_path and --doc_embeddings"
+            "Paper evaluation requires --corpus_path and --doc_embeddings"
         )
 
     seed_checkpoints = _resolve_seed_checkpoints(parser, args)
@@ -3432,6 +4426,10 @@ def main() -> None:
         parser.error("checkpoint requires its Phase-II training BGE-index fingerprint")
     os.makedirs(args.output_dir, exist_ok=True)
 
+    if args.qca_llm_mode == "panel":
+        _evaluate_qca_llm_panel(args, seed_checkpoints, checkpoint_configs)
+        return
+
     datasets_to_eval = (
         ["nq", "hotpotqa", "musique", "2wikimultihopqa"]
         if args.dataset == "all"
@@ -3439,6 +4437,7 @@ def main() -> None:
     )
     all_results: Dict[str, Dict[str, Any]] = {}
     evaluation_retrieval_provenance: Dict[str, Dict[str, Any]] = {}
+    oracle_qca_label_sources: Dict[str, Dict[str, Any]] = {}
 
     for dataset_name in datasets_to_eval:
         print(f"\n{'=' * 60}")
@@ -3449,29 +4448,55 @@ def main() -> None:
             dataset_name,
             args.max_samples,
             args.eval_data_path,
-            require_clara_archive=is_clara_baseline,
+            require_clara_archive=(
+                is_clara_baseline and args.retrieval_mode == "normal"
+            ),
             clara_archive_dir=args.clara_archive_dir,
         )
+        all_example_ids = _extract_example_ids(dataset, dataset_name)
+        qca_reference_types: Optional[List[str]] = None
+        if args.oracle_qca_labels is not None:
+            label_path = _format_artifact_path(
+                args.oracle_qca_labels,
+                dataset=dataset_name,
+                compression_rate=args.compression_rate,
+            )
+            qca_labels = _load_oracle_qca_labels(label_path)
+            labeled_indices, qca_reference_types = _oracle_qca_labeled_subset(
+                all_example_ids,
+                qca_labels,
+                dataset_name=dataset_name,
+            )
+            dataset = dataset.select(labeled_indices)
+            example_ids = [all_example_ids[index] for index in labeled_indices]
+            _validate_oracle_qca_paper_panel(dataset_name, example_ids)
+            matched_id_hasher = hashlib.sha256()
+            for example_id in example_ids:
+                matched_id_hasher.update(str(example_id).encode("utf-8"))
+                matched_id_hasher.update(b"\n")
+            oracle_qca_label_sources[dataset_name] = {
+                "protocol": ORACLE_QCA_PROTOCOL,
+                "source_path": str(Path(label_path).resolve()),
+                "source_sha256": file_sha256(Path(label_path)),
+                "source_label_count": len(qca_labels),
+                "matched_label_count": len(qca_reference_types),
+                "matched_example_ids_sha256": matched_id_hasher.hexdigest(),
+            }
+        else:
+            example_ids = all_example_ids
         questions = [item[question_key] for item in dataset]
-        gold_answers = [_extract_gold_answers(item, answer_key) for item in dataset]
+        gold_answers = [_extract_gold_answer(item, answer_key) for item in dataset]
         gold_document_ids = _extract_gold_document_ids(dataset)
         if args.retrieval_mode == "oracle" and gold_document_ids is None:
             raise ValueError(
                 "--retrieval_mode oracle requires prepared evaluation rows with "
                 "corpus-level gold_doc_ids"
             )
-        example_ids = _extract_example_ids(dataset, dataset_name)
         clara_documents: Optional[List[List[str]]] = None
         clara_candidate_doc_ids: Optional[List[List[str]]] = None
         clara_candidate_page_ids: Optional[List[List[str]]] = None
-        clara_gold_candidate_indices: Optional[List[List[int]]] = None
-        if is_clara_baseline:
-            (
-                clara_documents,
-                clara_candidate_doc_ids,
-                clara_candidate_page_ids,
-                clara_gold_candidate_indices,
-            ) = _extract_clara_candidate_columns(dataset)
+        if is_clara_baseline and args.retrieval_mode == "normal":
+            clara_documents = _extract_clara_candidate_columns(dataset)
         print(f"Loaded {len(questions)} examples")
 
         corpus_docs: List[str] = []
@@ -3480,58 +4505,117 @@ def main() -> None:
         corpus_digest: Optional[str] = None
         doc_embeddings: Optional[torch.Tensor] = None
         bm25_index: Optional[_BM25Index] = None
-        if not is_clara_baseline:
-            try:
-                corpus = load_corpus(args.corpus_path)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Full RAG requires a loadable KILT corpus ({dataset_name})"
-                ) from exc
-            corpus_docs = [_corpus_text(item) for item in corpus]
-            corpus_ids = [_corpus_id(item, index) for index, item in enumerate(corpus)]
-            corpus_hashes = [_text_sha256(text) for text in corpus_docs]
-            corpus_urls = [
-                _corpus_page_url(item, index) for index, item in enumerate(corpus)
-            ]
-            corpus_digest = _corpus_sha256(corpus_ids, corpus_hashes, corpus_urls)
-            if len(corpus_ids) != len(set(corpus_ids)):
-                raise ValueError("Corpus document IDs must be unique")
-            embeddings_path = _format_artifact_path(
-                args.doc_embeddings,
-                dataset=dataset_name,
-                compression_rate=args.compression_rate,
+        try:
+            corpus = load_corpus(args.corpus_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Paper evaluation requires a loadable KILT corpus ({dataset_name})"
+            ) from exc
+        corpus_docs = [_corpus_text(item) for item in corpus]
+        corpus_ids = [_corpus_id(item, index) for index, item in enumerate(corpus)]
+        corpus_hashes = [_text_sha256(text) for text in corpus_docs]
+        corpus_urls = [
+            _corpus_page_url(item, index) for index, item in enumerate(corpus)
+        ]
+        corpus_digest = _corpus_sha256(corpus_ids, corpus_hashes, corpus_urls)
+        if len(corpus_ids) != len(set(corpus_ids)):
+            raise ValueError("Corpus document IDs must be unique")
+        embeddings_path = _format_artifact_path(
+            args.doc_embeddings,
+            dataset=dataset_name,
+            compression_rate=args.compression_rate,
+        )
+        loaded_embeddings = load_doc_embeddings(
+            embeddings_path,
+            len(corpus_docs),
+            expected_ids=corpus_ids,
+            expected_hashes=corpus_hashes,
+            expected_page_ids=corpus_urls,
+            return_index_sha256=True,
+            return_encoder_spec=args.retrieval_mode == "oracle",
+        )
+        oracle_encoder_spec: Optional[Dict[str, Any]] = None
+        if args.retrieval_mode == "oracle":
+            doc_embeddings, evaluation_index_sha256, oracle_encoder_spec = (
+                loaded_embeddings
             )
-            doc_embeddings, evaluation_index_sha256 = load_doc_embeddings(
-                embeddings_path,
-                len(corpus_docs),
-                expected_ids=corpus_ids,
-                expected_hashes=corpus_hashes,
-                expected_page_ids=corpus_urls,
-                return_index_sha256=True,
+        else:
+            doc_embeddings, evaluation_index_sha256 = loaded_embeddings
+        if clara_documents is not None:
+            (
+                clara_candidate_doc_ids,
+                clara_candidate_page_ids,
+                _,
+            ) = _map_clara_candidates_to_corpus(
+                clara_documents,
+                corpus_docs=corpus_docs,
+                corpus_ids=corpus_ids,
+                corpus_page_ids=corpus_urls,
             )
+        shared_oracle_pool_records: Optional[List[OraclePoolRecord]] = None
+        if args.retrieval_mode == "oracle":
+            if gold_document_ids is None or oracle_encoder_spec is None:
+                raise RuntimeError("Oracle pool inputs are unavailable")
+            oracle_query_embeddings = _encode_oracle_queries(
+                questions, oracle_encoder_spec
+            )
+            shared_oracle_pool_records = _build_shared_oracle_pool_records(
+                oracle_query_embeddings,
+                doc_embeddings,
+                corpus_ids=corpus_ids,
+                corpus_page_ids=corpus_urls,
+                gold_doc_ids=gold_document_ids,
+            )
+        evaluation_retrieval_provenance[dataset_name] = {
+            "retrieval_mode": args.retrieval_mode,
+            "corpus_role": (
+                "oracle_bge_top100_source_full_kilt"
+                if args.retrieval_mode == "oracle"
+                else "normal_evaluation_full_kilt"
+            ),
+            "corpus_sha256": corpus_digest,
+            "corpus_count": len(corpus_ids),
+            "corpus_unique_page_count": len(set(corpus_urls)),
+            "corpus_sha256_scheme": CORPUS_SHA256_SCHEME,
+            "page_id_scheme": "canonical-page-url-v1",
+            "index_sha256": evaluation_index_sha256,
+            "bge_model": PAPER_BGE_MODEL,
+            "text_sha256_scheme": TEXT_SHA256_SCHEME,
+            "mads_semantic_source": "shared_bge_document_embeddings",
+        }
+        if oracle_encoder_spec is not None:
             evaluation_retrieval_provenance[dataset_name] = {
-                "retrieval_mode": args.retrieval_mode,
-                "corpus_role": (
-                    "oracle_bge_top100_source_full_kilt"
-                    if args.retrieval_mode == "oracle"
-                    else "normal_evaluation_full_kilt"
-                ),
-                "corpus_sha256": corpus_digest,
-                "corpus_count": len(corpus_ids),
-                "corpus_unique_page_count": len(set(corpus_urls)),
-                "corpus_sha256_scheme": CORPUS_SHA256_SCHEME,
-                "page_id_scheme": "canonical-page-url-v1",
-                "index_sha256": evaluation_index_sha256,
-                "bge_model": "BAAI/bge-large-en-v1.5",
-                "text_sha256_scheme": TEXT_SHA256_SCHEME,
-                "mads_semantic_source": "shared_bge_document_embeddings",
+                **evaluation_retrieval_provenance[dataset_name],
+                "oracle_query_embedding_protocol": ORACLE_QUERY_EMBEDDING_PROTOCOL,
+                "oracle_encoder_source": oracle_encoder_spec["source"],
+                "oracle_encoder_revision": oracle_encoder_spec["revision"],
             }
-            if args.retrieval_mode == "normal":
-                _assert_normal_retrieval_is_not_training_index(
-                    first_checkpoint_config,
-                    evaluation_corpus_sha256=corpus_digest,
-                    evaluation_index_sha256=evaluation_index_sha256,
-                )
+        if qca_reference_types is not None:
+            evaluation_retrieval_provenance[dataset_name].update(
+                {
+                    "qca_mode": ORACLE_QCA_PROTOCOL,
+                    "qca_labeled_example_count": len(qca_reference_types),
+                    "qca_label_source_sha256": oracle_qca_label_sources[
+                        dataset_name
+                    ]["source_sha256"],
+                }
+            )
+        if args.qca_llm_mode == "qa":
+            evaluation_retrieval_provenance[dataset_name].update(
+                {
+                    "qca_mode": QCA_LLM_PROTOCOL,
+                    "qca_prompt_version": QCA_LLM_PROMPT_VERSION,
+                    "qca_prompt_template_sha256": QCA_LLM_PROMPT_SHA256,
+                    "qca_adapters_disabled": True,
+                }
+            )
+        if args.retrieval_mode == "normal":
+            _assert_normal_retrieval_is_not_training_index(
+                first_checkpoint_config,
+                evaluation_corpus_sha256=corpus_digest,
+                evaluation_index_sha256=evaluation_index_sha256,
+            )
+        if not is_clara_baseline:
             # BM25 is immutable after build, so all independently trained
             # checkpoints for this benchmark can safely share one full index.
             bm25_index = _BM25Index().build(corpus_docs)
@@ -3544,6 +4628,7 @@ def main() -> None:
         checkpoint_results: List[Dict[str, Any]] = []
         checkpoint_times: List[float] = []
         protocol_fingerprints: List[Dict[str, Any]] = []
+        qca_llm_records: Optional[List[Dict[str, Any]]] = None
         for training_seed, checkpoint_path in seed_checkpoints:
             seed_label = f"seed {training_seed}" if training_seed is not None else "single"
             print(f"\nLoading {seed_label} checkpoint: {checkpoint_path}")
@@ -3601,6 +4686,12 @@ def main() -> None:
 
             model = model.to(args.device)
             model.eval()
+            if args.qca_llm_mode == "qa" and qca_llm_records is None:
+                qca_llm_records = _run_qca_llm_router(
+                    model,
+                    questions,
+                    batch_size=args.batch_size,
+                )
             evaluator = ARIAEvaluator(
                 model=model,
                 corpus_docs=corpus_docs,
@@ -3619,11 +4710,13 @@ def main() -> None:
                 questions=questions,
                 gold_answers=gold_answers,
                 example_ids=example_ids,
-                gold_doc_ids=(None if is_clara_baseline else gold_document_ids),
+                gold_doc_ids=gold_document_ids,
                 documents=clara_documents,
                 clara_candidate_doc_ids=clara_candidate_doc_ids,
                 clara_candidate_page_ids=clara_candidate_page_ids,
-                clara_gold_candidate_indices=clara_gold_candidate_indices,
+                oracle_pool_records=shared_oracle_pool_records,
+                qca_reference_types=qca_reference_types,
+                qca_llm_records=qca_llm_records,
                 batch_size=args.batch_size,
                 max_new_tokens=args.max_new_tokens,
             )
@@ -3675,6 +4768,10 @@ def main() -> None:
             )
 
     result_prefix = "aria" if expected_configuration == "full" else expected_configuration
+    if args.oracle_qca_labels is not None:
+        result_prefix += "_oracle_qca"
+    elif args.qca_llm_mode == "qa":
+        result_prefix += "_qca_llm"
     compression_label = (
         f"cr1_sourcecr{args.compression_rate}"
         if is_no_compression
@@ -3708,7 +4805,7 @@ def main() -> None:
             "checkpoints": [path for _, path in seed_checkpoints],
             "inference_seed": args.inference_seed,
             "normalization": "ARIA Appendix A.35",
-            "answer_alias_contract": EVALUATION_ANSWER_ALIAS_CONTRACT,
+            "answer_contract": EVALUATION_ANSWER_CONTRACT,
             "rag_configuration": expected_configuration,
             "checkpoint_rag_configuration": _required_checkpoint_configuration(
                 expected_configuration
@@ -3748,9 +4845,52 @@ def main() -> None:
                 else None
             ),
             "evaluation_retrieval_provenance": evaluation_retrieval_provenance,
+            "oracle_qca": (
+                {
+                    "protocol": ORACLE_QCA_PROTOCOL,
+                    "scope": "explicitly-labeled-evaluation-subset-only",
+                    "paper_panel_counts": dict(ORACLE_QCA_PANEL_COUNTS),
+                    "paper_panel_total": sum(ORACLE_QCA_PANEL_COUNTS.values()),
+                    "surface_fields_preserved": [
+                        "confidence",
+                        "matched_rules",
+                        "hop_count",
+                        "sub_questions",
+                        "entity_count",
+                    ],
+                    "label_sources": oracle_qca_label_sources,
+                }
+                if args.oracle_qca_labels is not None
+                else None
+            ),
+            "qca_llm": (
+                {
+                    "protocol": QCA_LLM_PROTOCOL,
+                    "endpoint": "full-four-benchmark-qa",
+                    "prompt_version": QCA_LLM_PROMPT_VERSION,
+                    "prompt_template_sha256": QCA_LLM_PROMPT_SHA256,
+                    "base_model": PAPER_QCA_LLM_MODEL,
+                    "base_model_revision_resolved": getattr(
+                        first_checkpoint_config,
+                        "decoder_model_resolved_revision",
+                        None,
+                    ),
+                    "adapters_disabled": True,
+                    "decoding": "greedy-eos-or-64",
+                    "surface_fields_preserved": [
+                        "confidence",
+                        "matched_rules",
+                        "hop_count",
+                        "sub_questions",
+                        "entity_count",
+                    ],
+                }
+                if args.qca_llm_mode == "qa"
+                else None
+            ),
             "clara_archive_sha256": (
                 dict(_REPOSITORY_EVAL_ARCHIVE_SHA256)
-                if is_clara_baseline
+                if is_clara_baseline and args.retrieval_mode == "normal"
                 else None
             ),
             "oracle_protocol": (
@@ -3758,13 +4898,27 @@ def main() -> None:
                     "name": ORACLE_TOP100_PROTOCOL,
                     "pool_size": 100,
                     "base_order": "BGE score descending, corpus index ascending on ties",
+                    "query_embedding": ORACLE_QUERY_EMBEDDING_PROTOCOL,
+                    "shared_between_aria_and_clara": True,
                     "page_deduplication": "retain first ranked occurrence of each canonical page URL",
                     "positive_insertion": "missing gold pages at tail in annotation order",
                     "eviction": "lowest-ranked non-gold pages first",
-                    "candidate_acquisition_scope": "replaces AHR and IGFR",
-                    "first_ranking_stage": "MADS then CCEF",
-                    "mtfrl_scope": "same fixed top-100 pool",
-                    "reported_recall_scope": "final page-deduplicated CFRS order at k=1,3,5",
+                    "candidate_acquisition_scope": "shared fixed top-100 pool",
+                    "first_ranking_stage": (
+                        "CLaRa trained-QR hard top-5 selector"
+                        if is_clara_baseline
+                        else "MADS then CCEF"
+                    ),
+                    "mtfrl_scope": (
+                        None
+                        if is_clara_baseline
+                        else "same fixed top-100 pool"
+                    ),
+                    "reported_recall_scope": (
+                        "CLaRa hard top-5 page order"
+                        if is_clara_baseline
+                        else "final page-deduplicated CFRS order at k=1,3,5"
+                    ),
                 }
                 if args.retrieval_mode == "oracle"
                 else None

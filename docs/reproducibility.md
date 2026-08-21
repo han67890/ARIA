@@ -7,7 +7,7 @@ This checklist targets the submitted ARIA method (`ARIA_old.tex`). Version
 
 | Item | Submission-compatible behavior |
 |---|---|
-| QCA | hop match plus at least two entities; hop wins hop/aspect conflict |
+| QCA | Multi-Hop requires hop plus two entities; Multi-Aspect requires aspect and no hop |
 | AHR | type weights; confidence drives fallback toward `(0.5, 0.5)` |
 | CCEF | fixed top-five survivor contract |
 | ACR | literal `range + 1e-6` normalization; sigmoid soft mask |
@@ -18,6 +18,9 @@ This checklist targets the submitted ARIA method (`ARIA_old.tex`). Version
 | MTFRL | hard `T_i` prefixes from five documents; one top-200 round |
 | `P_fb` initialization | derived from fitted `W_BGE` |
 | ARIA-NoComp | fixed checkpoint, first-pass top-five direct context |
+| Oracle-QCA | external keyed labels; label-only override under Normal/full/16x |
+| QCA-LLM | adapter-free zero-shot Mistral label-only override; full QA and exact 1,000-query endpoints |
+| Answer metrics | one prepared scalar `answer` shared by EM, CEM, and F1 |
 
 ## Optimization record
 
@@ -47,6 +50,9 @@ interpolates AHR weights between the balanced and type-conditioned endpoints
 and fails fast when CCEF/MTFRL cannot supply five real documents. Tests label
 these as release conventions. Neither changes the normal five-document paper
 path.
+ARIA-NoComp reserves 64 generation tokens under its 32,768-token ceiling and
+truncates only the evidence tail when a direct-context prompt exceeds the
+remaining budget.
 
 ## Checks
 

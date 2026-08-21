@@ -26,9 +26,9 @@ called out even when they remain backward-compatible at the API level.
 - Restored the fixed top-five CCEF contract and removed later method-only
   checkpoint requirements, including physical-global likelihood-reduction,
   selected-document cosine-ST, hidden-mean CFRS, and hard-gate metadata.
-- Kept ARIA-NoComp as the submission's existing fixed-checkpoint top-five
-  direct-context diagnostic, without presenting later native-window
-  no-truncation failure rules as a new paper protocol.
+- Kept ARIA-NoComp as the submission's fixed-checkpoint top-five direct-context
+  diagnostic, with a 64-token reserve and question-preserving evidence-tail
+  truncation under its 32,768-token ceiling.
 - Documented release conventions separately from manuscript requirements:
   continuous confidence interpolation and fail-fast five-document validation
   affect only otherwise unspecified edges.
@@ -39,18 +39,24 @@ called out even when they remain backward-compatible at the API level.
 - Corrected package licensing to the mixed SPDX expression
   `AML AND Apache-2.0 AND CC-BY-NC-4.0`, retained upstream notices, and scoped
   Apache-2.0 solely to original ARIA additions owned by their copyright holder.
-- Made paper answer evaluation fail closed: every row now requires an explicit
-  benchmark-provided `gold_answers` list and a matching evaluation-manifest
-  contract. External scalar-answer ZIPs are candidate-only CLaRa artifacts.
+- Restored the official scalar-answer evaluation contract: every prepared row
+  supplies one `answer`, and paper EM, CEM, F1, and training-time validation CEM
+  use that same reference. The fixed Phase-II epoch-view schedule is recorded as
+  `(42, 123, 456, 789, 2024)` independently of the training-run seed.
+- Added full-corpus CLaRa Normal Recall, shared ARIA/CLaRa Oracle top-100 pools,
+  exact-panel Oracle-QCA, and adapter-free zero-shot QCA-LLM QA/panel endpoints;
+  all save their candidate, label, prompt, and identity provenance.
 - Removed all four 224 MiB CLaRa candidate ZIPs from the source tree. Matched
   CLaRa now requires an explicit `--clara_archive_dir`; all four files, raw ZIP
   digests, required members, candidate fingerprints, and exact question joins
   are validated fail-closed.
 - Removed the obsolete MiniLM MADS console entry from package metadata.
-- Separated the 16x budget/topology-matched coupling retraining controls from
-  fixed-checkpoint forward interventions. `remove_all_coupling` now denotes
-  the independently retrained 108-token/static-D2 control, while
-  `forward_path_off` denotes rho=1/no-D2 inference on a full checkpoint.
+- The paper coupling table uses the `fixed_*` and `forward_path_off`
+  interventions on full checkpoints. Independently retrained 16x
+  budget/topology variants remain available as additional release controls.
+- Bound the complete 168,745-row historical MuSiQue derived source to an
+  external four-family manifest with recomputed content and parent-link
+  digests; raw MuSiQue is no longer presented as sufficient to rebuild it.
 
 ## 0.1.0
 

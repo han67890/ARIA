@@ -42,19 +42,15 @@ from datasets import (
     load_dataset,
     load_from_disk,
 )
-from openrlhf.utils.musique_augmentation import (
-    MUSIQUE_PARTIAL_CHAIN_PROTOCOL,
-    MUSIQUE_PARTIAL_CHAIN_TARGET,
-    build_musique_partial_rows,
-    validate_musique_partial_metadata,
-)
 from openrlhf.utils.aria_provenance import (
-    EVALUATION_ANSWER_ALIAS_CONTRACT,
+    EVALUATION_ANSWER_CONTRACT,
     EVALUATION_GOLD_DOCUMENT_CONTRACT,
+    file_sha256,
 )
 
 
 PROTOCOL_VERSION = "aria-paper-v1"
+PAPER_PHASE2_EPOCH_SEEDS: Tuple[int, ...] = (42, 123, 456, 789, 2024)
 _MUSIQUE_NLP = None
 
 # Table A19.  The exact total is 7,808,465 (the main text rounds it to 7.8M).
@@ -91,15 +87,14 @@ EVALUATION_COUNTS: Mapping[str, int] = {
     "2wikimultihopqa": 12_576,
 }
 
-# Appendix A.33 reports these artifact counts. The repository's explicit v2
-# partial-state builder preserves every k-1 prefix and deterministically adds
-# non-leaking subset/frontier states to reconcile the reported 70,845 rows.
+# Appendix A.33 historical derived-artifact counts.
 MUSIQUE_AUGMENTATION_COUNTS: Mapping[str, int] = {
     "original": 19_938,
     "subquestion": 52_107,
     "partial_chain": 70_845,
     "entity_variant": 25_855,
 }
+MUSIQUE_DERIVED_MANIFEST_PROTOCOL = "aria-musique-derived-source-v1"
 
 
 @dataclass(frozen=True)
@@ -126,10 +121,6 @@ class Phase1FieldMap:
 class Phase2FieldMap:
     question_key: str = "question"
     answer_key: str = "answer"
-    # Paper evaluation requires this explicit benchmark-provided alias set.
-    # It is deliberately separate from ``answer_key`` so a scalar answer can
-    # never be silently promoted to a complete alias annotation.
-    gold_answers_key: str = "gold_answers"
     docs_key: str = "docs"
     pos_index_key: str = "pos_index"
     # Every source must provide the complete corpus-level annotation
@@ -149,16 +140,7 @@ class Phase2FieldMap:
     rouge_l_key: str = "rouge_l"
     decomposition_preserved_key: str = "decomposition_preserved"
     answer_preserved_key: str = "answer_preserved"
-    partial_state_id_key: str = "partial_state_id"
-    partial_state_protocol_key: str = "partial_state_protocol"
-    partial_state_kind_key: str = "partial_state_kind"
-    partial_hop_count_key: str = "partial_hop_count"
-    partial_known_hop_indices_key: str = "partial_known_hop_indices"
-    partial_frontier_hop_index_key: str = "partial_frontier_hop_index"
-    partial_mandatory_prefix_key: str = "partial_mandatory_prefix"
-    partial_prompt_sha256_key: str = "partial_prompt_sha256"
-    partial_selection_sha256_key: str = "partial_selection_sha256"
-    needs_candidate_retrieval_key: str = "needs_candidate_retrieval"
+    decomposition_key: str = "question_decomposition"
 
 
 def _require_nonempty_string(value: Any, *, location: str) -> str:
@@ -421,7 +403,7 @@ def _normalize_phase1_row(
     )
     return {
         "docs": [document],
-        # Phase I retains the four released target families but conditions the
+        # Phase I retains the submission's four target families but conditions the
         # decoder only on F(d), never on the source task instruction.
         "question": "",
         "answer": target,
@@ -766,10 +748,18 @@ def _normalize_phase2_row(
         _require_field(row, field_map.question_key, location=location),
         location=f"{location}.{field_map.question_key}",
     )
-    answer, gold_answers = _normalize_answers(
-        _require_field(row, field_map.answer_key, location=location),
-        location=f"{location}.{field_map.answer_key}",
-    )
+    raw_answer = _require_field(row, field_map.answer_key, location=location)
+    if evaluation_mode:
+        answer = _require_nonempty_string(
+            raw_answer,
+            location=f"{location}.{field_map.answer_key}",
+        )
+        gold_answers = [answer]
+    else:
+        answer, gold_answers = _normalize_answers(
+            raw_answer,
+            location=f"{location}.{field_map.answer_key}",
+        )
     source_row_id = str(
         _require_field(row, field_map.source_id_key, location=location)
     ).strip()
@@ -809,31 +799,6 @@ def _normalize_phase2_row(
             f"{location}.{field_map.gold_doc_ids_key} omits candidate positives: "
             f"{missing_candidate_labels[:3]}"
         )
-    if evaluation_mode:
-        if field_map.gold_answers_key not in row:
-            raise ValueError(
-                f"{location} requires field {field_map.gold_answers_key!r} with "
-                "a non-empty list of benchmark-provided gold aliases"
-            )
-        raw_gold_answers = _require_field(
-            row, field_map.gold_answers_key, location=location
-        )
-        if not isinstance(raw_gold_answers, (list, tuple)) or not raw_gold_answers:
-            raise ValueError(
-                f"{location}.{field_map.gold_answers_key} must be a non-empty "
-                "list of benchmark-provided gold aliases"
-            )
-        explicit_aliases = [
-            _require_nonempty_string(
-                value,
-                location=f"{location}.{field_map.gold_answers_key}[{index}]",
-            )
-            for index, value in enumerate(raw_gold_answers)
-        ]
-        # The primary answer and the explicit alias field both originate in the
-        # benchmark annotation.  Preserve their union without synthesizing any
-        # spelling variants.
-        gold_answers = list(dict.fromkeys([*gold_answers, *explicit_aliases]))
     augmentation_type = "original"
     augmentation_metadata: Dict[str, Any] = {
         "augmentation_parent_id": "",
@@ -842,15 +807,6 @@ def _normalize_phase2_row(
         "decomposition_preserved": False,
         "answer_preserved": False,
         "rouge_l": -1.0,
-        "partial_state_id": "",
-        "partial_state_protocol": "",
-        "partial_state_kind": "",
-        "partial_hop_count": -1,
-        "partial_known_hop_indices": [],
-        "partial_frontier_hop_index": -1,
-        "partial_mandatory_prefix": False,
-        "partial_prompt_sha256": "",
-        "partial_selection_sha256": "",
     }
     if benchmark == "musique" and require_musique_augmentation:
         augmentation_type = _normalize_augmentation_type(
@@ -866,93 +822,9 @@ def _normalize_phase2_row(
                 _require_field(row, field_map.construction_method_key, location=location),
                 location=f"{location}.{field_map.construction_method_key}",
             )
-            expected_method = {
-                "subquestion": "deterministic_template",
-                "partial_chain": MUSIQUE_PARTIAL_CHAIN_PROTOCOL,
-                "entity_variant": "gpt-5.5_entity_variant",
-            }.get(augmentation_type)
-            if method != expected_method:
-                raise ValueError(
-                    f"{location} construction_method must be {expected_method!r} for "
-                    f"{augmentation_type!r}, got {method!r}"
-                )
             augmentation_metadata.update(
                 augmentation_parent_id=parent_id,
                 construction_method=method,
-            )
-        if augmentation_type == "partial_chain":
-            if _require_field(
-                row, field_map.needs_candidate_retrieval_key, location=location
-            ) is not False:
-                raise ValueError(
-                    f"{location} requires fresh BGE top-5 candidates before Phase II"
-                )
-            partial_values = {
-                "augmentation_parent_id": augmentation_metadata[
-                    "augmentation_parent_id"
-                ],
-                "partial_state_id": _require_field(
-                    row, field_map.partial_state_id_key, location=location
-                ),
-                "partial_state_protocol": _require_field(
-                    row, field_map.partial_state_protocol_key, location=location
-                ),
-                "partial_state_kind": _require_field(
-                    row, field_map.partial_state_kind_key, location=location
-                ),
-                "partial_hop_count": _require_field(
-                    row, field_map.partial_hop_count_key, location=location
-                ),
-                "partial_known_hop_indices": _require_field(
-                    row, field_map.partial_known_hop_indices_key, location=location
-                ),
-                "partial_frontier_hop_index": _require_field(
-                    row, field_map.partial_frontier_hop_index_key, location=location
-                ),
-            }
-            validate_musique_partial_metadata(partial_values)
-            if source_row_id != partial_values["partial_state_id"]:
-                raise ValueError(
-                    f"{location} source_row_id must equal its partial_state_id"
-                )
-            mandatory_prefix = _require_field(
-                row, field_map.partial_mandatory_prefix_key, location=location
-            )
-            if not isinstance(mandatory_prefix, bool):
-                raise ValueError(f"{location}.partial_mandatory_prefix must be boolean")
-            prompt_sha256 = _require_nonempty_string(
-                _require_field(
-                    row, field_map.partial_prompt_sha256_key, location=location
-                ),
-                location=f"{location}.partial_prompt_sha256",
-            )
-            if prompt_sha256 != hashlib.sha256(question.encode("utf-8")).hexdigest():
-                raise ValueError(f"{location} partial prompt SHA-256 mismatch")
-            selection_sha256 = _require_nonempty_string(
-                _require_field(
-                    row, field_map.partial_selection_sha256_key, location=location
-                ),
-                location=f"{location}.partial_selection_sha256",
-            )
-            if re.fullmatch(r"[0-9a-f]{64}", selection_sha256) is None:
-                raise ValueError(
-                    f"{location}.partial_selection_sha256 must be lowercase SHA-256"
-                )
-            augmentation_metadata.update(
-                partial_state_id=str(partial_values["partial_state_id"]),
-                partial_state_protocol=str(partial_values["partial_state_protocol"]),
-                partial_state_kind=str(partial_values["partial_state_kind"]),
-                partial_hop_count=int(partial_values["partial_hop_count"]),
-                partial_known_hop_indices=list(
-                    partial_values["partial_known_hop_indices"]
-                ),
-                partial_frontier_hop_index=int(
-                    partial_values["partial_frontier_hop_index"]
-                ),
-                partial_mandatory_prefix=mandatory_prefix,
-                partial_prompt_sha256=prompt_sha256,
-                partial_selection_sha256=selection_sha256,
-                answer_preserved=True,
             )
         if augmentation_type == "entity_variant":
             entity_preserved = _require_field(
@@ -985,7 +857,6 @@ def _normalize_phase2_row(
     result: Dict[str, Any] = {
         "question": question,
         "answer": answer,
-        "gold_answers": gold_answers,
         "docs": docs,
         # Singular field name retained intentionally: it is an aligned list with
         # exactly one canonical page URL per candidate document.
@@ -1003,6 +874,8 @@ def _normalize_phase2_row(
         "augmentation_type": augmentation_type,
         **augmentation_metadata,
     }
+    if not evaluation_mode:
+        result["gold_answers"] = gold_answers
     return result
 
 
@@ -1045,7 +918,210 @@ def _rouge_l_f1(left: str, right: str) -> float:
     return 2 * precision * recall / max(precision + recall, 1e-12)
 
 
+def _canonical_manifest_value(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MuSiQue derived rows must contain JSON-serializable values"
+        ) from exc
+
+
+def _update_canonical_row_digest(hasher: Any, row: Mapping[str, Any]) -> None:
+    hasher.update(_canonical_manifest_value(dict(row)).encode("utf-8"))
+    hasher.update(b"\n")
+
+
+def _validate_musique_derived_manifest(
+    raw: Dataset,
+    field_map: Phase2FieldMap,
+    manifest_path: str,
+) -> Dict[str, Any]:
+    """Verify the artifact-owner-supplied historical MuSiQue derived source."""
+    path = Path(manifest_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"MuSiQue derived manifest does not exist: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        try:
+            manifest = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise ValueError("MuSiQue derived manifest must be valid JSON") from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError("MuSiQue derived manifest must be a JSON object")
+    if manifest.get("protocol") != MUSIQUE_DERIVED_MANIFEST_PROTOCOL:
+        raise ValueError(
+            "MuSiQue derived manifest protocol must be "
+            f"{MUSIQUE_DERIVED_MANIFEST_PROTOCOL!r}"
+        )
+    if manifest.get("total_count") != PHASE2_POOL_COUNTS["musique"]:
+        raise ValueError("MuSiQue derived manifest total_count is not 168,745")
+    if manifest.get("family_counts") != dict(MUSIQUE_AUGMENTATION_COUNTS):
+        raise ValueError("MuSiQue derived manifest family_counts do not match the paper")
+    if manifest.get("source_columns") != list(raw.column_names):
+        raise ValueError(
+            "MuSiQue derived manifest source_columns do not match the source schema"
+        )
+    if manifest.get("field_map") != asdict(field_map):
+        raise ValueError(
+            "MuSiQue derived manifest field_map does not match the configured schema"
+        )
+
+    source_hasher = hashlib.sha256()
+    family_hashers = {
+        family: hashlib.sha256() for family in MUSIQUE_AUGMENTATION_COUNTS
+    }
+    parent_link_hasher = hashlib.sha256()
+    family_counts = {family: 0 for family in MUSIQUE_AUGMENTATION_COUNTS}
+    originals: Dict[str, Tuple[str, str, Set[str]]] = {}
+    seen_source_ids: Set[str] = set()
+
+    for row_index, raw_row in enumerate(raw):
+        row = dict(raw_row)
+        family = _normalize_augmentation_type(
+            _require_field(
+                row,
+                field_map.augmentation_type_key,
+                location=f"MuSiQue derived row {row_index}",
+            ),
+            location=f"MuSiQue derived row {row_index}.augmentation_type",
+        )
+        if family not in family_counts:
+            raise ValueError(
+                f"MuSiQue derived row {row_index} has unknown family {family!r}"
+            )
+        source_id = str(
+            _require_field(
+                row,
+                field_map.source_id_key,
+                location=f"MuSiQue derived row {row_index}",
+            )
+        ).strip()
+        if not source_id:
+            raise ValueError(f"MuSiQue derived row {row_index} has an empty source ID")
+        if source_id in seen_source_ids:
+            raise ValueError(
+                f"MuSiQue derived row {row_index} repeats source ID {source_id!r}"
+            )
+        seen_source_ids.add(source_id)
+        decomposition = _require_field(
+            row,
+            field_map.decomposition_key,
+            location=f"MuSiQue derived row {row_index}",
+        )
+        if (
+            not isinstance(decomposition, Sequence)
+            or isinstance(decomposition, (str, bytes, bytearray))
+            or not decomposition
+        ):
+            raise ValueError(
+                f"MuSiQue derived row {row_index} requires a non-empty decomposition"
+            )
+        answer = _require_field(
+            row,
+            field_map.answer_key,
+            location=f"MuSiQue derived row {row_index}",
+        )
+        parent_id = ""
+        if family == "original":
+            hop_answers = {
+                _canonical_manifest_value(hop["answer"])
+                for hop in decomposition
+                if isinstance(hop, Mapping) and "answer" in hop
+            }
+            originals[source_id] = (
+                _canonical_manifest_value(answer),
+                _canonical_manifest_value(decomposition),
+                hop_answers,
+            )
+        else:
+            parent_id = _require_nonempty_string(
+                _require_field(
+                    row,
+                    field_map.augmentation_parent_id_key,
+                    location=f"MuSiQue derived row {row_index}",
+                ),
+                location=f"MuSiQue derived row {row_index}.augmentation_parent_id",
+            )
+        family_counts[family] += 1
+        _update_canonical_row_digest(source_hasher, row)
+        _update_canonical_row_digest(family_hashers[family], row)
+        parent_link_hasher.update(
+            _canonical_manifest_value(
+                [family, source_id, parent_id, answer, decomposition]
+            ).encode("utf-8")
+        )
+        parent_link_hasher.update(b"\n")
+
+    if len(originals) != MUSIQUE_AUGMENTATION_COUNTS["original"]:
+        raise ValueError("MuSiQue original family count does not match the manifest")
+    if family_counts != dict(MUSIQUE_AUGMENTATION_COUNTS):
+        raise ValueError(
+            "MuSiQue derived source family counts do not match the paper: "
+            f"{family_counts}"
+        )
+    # A second bounded-memory pass verifies every derived-parent contract after
+    # the complete original-ID table has been collected.
+    for row_index, raw_row in enumerate(raw):
+        row = dict(raw_row)
+        family = _normalize_augmentation_type(
+            row[field_map.augmentation_type_key],
+            location=f"MuSiQue derived row {row_index}.augmentation_type",
+        )
+        if family == "original":
+            continue
+        parent_id = str(row[field_map.augmentation_parent_id_key]).strip()
+        parent_contract = originals.get(parent_id)
+        if parent_contract is None:
+            raise ValueError(
+                f"MuSiQue derived row {row_index} references unknown parent {parent_id!r}"
+            )
+        parent_answer, parent_decomposition, parent_hop_answers = parent_contract
+        row_decomposition = _canonical_manifest_value(row[field_map.decomposition_key])
+        if row_decomposition != parent_decomposition:
+            raise ValueError(
+                f"MuSiQue derived row {row_index} changes its parent decomposition"
+            )
+        row_answer = _canonical_manifest_value(row[field_map.answer_key])
+        if family in {"partial_chain", "entity_variant"}:
+            if row_answer != parent_answer:
+                raise ValueError(
+                    f"MuSiQue derived row {row_index} changes its parent answer"
+                )
+        elif family == "subquestion" and row_answer not in parent_hop_answers:
+            raise ValueError(
+                f"MuSiQue subquestion row {row_index} answer is not an annotated hop answer"
+            )
+
+    computed_family_digests = {
+        family: hasher.hexdigest() for family, hasher in family_hashers.items()
+    }
+    declared_family_digests = manifest.get("family_content_sha256")
+    if declared_family_digests != computed_family_digests:
+        raise ValueError("MuSiQue derived manifest family content digests do not match")
+    if manifest.get("source_content_sha256") != source_hasher.hexdigest():
+        raise ValueError("MuSiQue derived manifest source content digest does not match")
+    if manifest.get("parent_link_sha256") != parent_link_hasher.hexdigest():
+        raise ValueError("MuSiQue derived manifest parent-link digest does not match")
+    return {
+        "protocol": MUSIQUE_DERIVED_MANIFEST_PROTOCOL,
+        "path": str(path.resolve()),
+        "manifest_sha256": file_sha256(path),
+        "source_content_sha256": source_hasher.hexdigest(),
+        "family_content_sha256": computed_family_digests,
+        "parent_link_sha256": parent_link_hasher.hexdigest(),
+        "family_counts": family_counts,
+        "source_columns": list(raw.column_names),
+        "field_map": asdict(field_map),
+    }
+
+
 def _validate_musique_augmentation(dataset: Dataset) -> Dict[str, int]:
+    """Validate normalized rows after the raw historical artifact check."""
     counts: Dict[str, int] = {key: 0 for key in MUSIQUE_AUGMENTATION_COUNTS}
     unexpected: Set[str] = set()
     for value in dataset["augmentation_type"]:
@@ -1065,30 +1141,6 @@ def _validate_musique_augmentation(dataset: Dataset) -> Dict[str, int]:
         for row in dataset
         if row["augmentation_type"] == "original"
     }
-    partial_state_ids = [
-        str(row["partial_state_id"])
-        for row in dataset
-        if row["augmentation_type"] == "partial_chain"
-    ]
-    if len(partial_state_ids) != MUSIQUE_PARTIAL_CHAIN_TARGET:
-        raise ValueError(
-            "MuSiQue partial-state protocol requires exactly "
-            f"{MUSIQUE_PARTIAL_CHAIN_TARGET:,} rows"
-        )
-    if len(set(partial_state_ids)) != len(partial_state_ids):
-        raise ValueError("MuSiQue partial_state_id values must be globally unique")
-    selected_digest = hashlib.sha256(
-        ("\n".join(sorted(partial_state_ids)) + "\n").encode("utf-8")
-    ).hexdigest()
-    selection_digests = {
-        str(row["partial_selection_sha256"])
-        for row in dataset
-        if row["augmentation_type"] == "partial_chain"
-    }
-    if selection_digests != {selected_digest}:
-        raise ValueError(
-            "MuSiQue partial rows do not share their exact selected-state digest"
-        )
     for row_index, row in enumerate(dataset):
         augmentation_type = row["augmentation_type"]
         if augmentation_type == "original":
@@ -1099,7 +1151,9 @@ def _validate_musique_augmentation(dataset: Dataset) -> Dict[str, int]:
             raise ValueError(
                 f"MuSiQue augmented row {row_index} references unknown original {parent_id!r}"
             )
-        if list(row["gold_answers"]) != list(parent["gold_answers"]):
+        if augmentation_type in {"partial_chain", "entity_variant"} and list(
+            row["gold_answers"]
+        ) != list(parent["gold_answers"]):
             raise ValueError(
                 f"MuSiQue augmented row {row_index} must preserve its parent answers"
             )
@@ -1117,90 +1171,21 @@ def _validate_musique_augmentation(dataset: Dataset) -> Dict[str, int]:
     return counts
 
 
-def _validate_musique_audit_manifest(manifest: Mapping[str, Any]) -> Dict[str, Any]:
-    """Require the two human checks reported in Appendix A.33."""
-    required = {
-        "human_filter_sample_fraction": 0.05,
-        "human_ai_kappa": 0.81,
-        "answer_audit_sample_size": 200,
-        "answer_preserved_count": 196,
-    }
-    normalized: Dict[str, Any] = {}
-    for key, expected in required.items():
-        if key not in manifest:
-            raise ValueError(f"MuSiQue verification manifest requires {key!r}")
-        value = manifest[key]
-        if isinstance(expected, float):
-            if not isinstance(value, (int, float)) or abs(float(value) - expected) > 1e-9:
-                raise ValueError(f"MuSiQue audit {key} must be {expected}, got {value}")
-            normalized[key] = float(value)
-        else:
-            if value != expected:
-                raise ValueError(f"MuSiQue audit {key} must be {expected}, got {value}")
-            normalized[key] = int(value)
-    normalized["answer_preservation_rate"] = 196 / 200
-    return normalized
-
-
 def _benchmark_seed(epoch_seed: int, benchmark: str) -> int:
     digest = hashlib.sha256(f"{epoch_seed}:{benchmark}".encode("utf-8")).digest()
     return int.from_bytes(digest[:4], byteorder="big", signed=False)
 
 
-def prepare_musique_partial_chains(
-    source_spec: SourceSpec,
-    output_dir: str,
-    *,
-    parent_id_key: str = "source_row_id",
-    question_key: str = "question",
-    answer_key: str = "answer",
-    decomposition_key: str = "question_decomposition",
-) -> Dataset:
-    """Materialize exactly 70,845 partial queries before candidate retrieval."""
-    raw = load_explicit_source(source_spec)
-    rows, selection_manifest = build_musique_partial_rows(
-        raw,
-        target_count=MUSIQUE_PARTIAL_CHAIN_TARGET,
-        parent_id_key=parent_id_key,
-        question_key=question_key,
-        answer_key=answer_key,
-        decomposition_key=decomposition_key,
-    )
-    if len(rows) != MUSIQUE_PARTIAL_CHAIN_TARGET:
-        raise RuntimeError("MuSiQue partial-chain builder returned the wrong count")
-    dataset = Dataset.from_list(rows)
-    output = Path(output_dir)
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError(
-            f"MuSiQue partial output directory must be empty: {output}"
+def _validate_phase2_epoch_seeds(epoch_seeds: Sequence[int]) -> Tuple[int, ...]:
+    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in epoch_seeds):
+        raise ValueError("Phase-II epoch seeds must be integers")
+    normalized = tuple(int(seed) for seed in epoch_seeds)
+    if normalized != PAPER_PHASE2_EPOCH_SEEDS:
+        raise ValueError(
+            "Paper Phase-II requires epoch seed schedule "
+            f"{PAPER_PHASE2_EPOCH_SEEDS}, got {normalized}"
         )
-    output.mkdir(parents=True, exist_ok=True)
-    dataset.save_to_disk(str(output))
-    manifest = {
-        "protocol_version": PROTOCOL_VERSION,
-        "phase": "musique_partial_chain_generation",
-        "source": asdict(source_spec),
-        "source_fields": {
-            "parent_id": parent_id_key,
-            "question": question_key,
-            "answer": answer_key,
-            "decomposition": decomposition_key,
-        },
-        "count": len(dataset),
-        "fingerprint": getattr(dataset, "_fingerprint", None),
-        "partial_chain": selection_manifest,
-        "candidate_retrieval_contract": {
-            "required": True,
-            "model": "BAAI/bge-large-en-v1.5",
-            "top_k": PHASE2_CANDIDATE_DOCS,
-            "scope": "page_url_deduplicated_phase2_training_corpus",
-            "reason": "the augmented query differs from its parent",
-            "completion_marker": "set needs_candidate_retrieval=false only after attaching fresh aligned candidates",
-        },
-    }
-    with (output / "aria_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, ensure_ascii=False, sort_keys=True)
-    return dataset
+    return normalized
 
 
 def prepare_phase2_data(
@@ -1209,21 +1194,25 @@ def prepare_phase2_data(
     output_dir: str,
     test_urls: Set[str],
     epoch_seeds: Sequence[int],
-    musique_audit_manifest: Mapping[str, Any],
     training_retrieval_index_sha256: str,
+    musique_derived_manifest_path: str,
 ) -> DatasetDict:
-    """Create five protocol-verifiable, class-balanced Phase-II epoch shards."""
+    """Create five protocol-verifiable, benchmark-balanced Phase-II epoch shards."""
 
     if set(source_specs) != set(PHASE2_BENCHMARKS):
         missing = sorted(set(PHASE2_BENCHMARKS) - set(source_specs))
         extra = sorted(set(source_specs) - set(PHASE2_BENCHMARKS))
         raise ValueError(f"Phase-II requires all four benchmark sources; missing={missing}, extra={extra}")
-    if len(epoch_seeds) != 5 or len(set(epoch_seeds)) != 5:
-        raise ValueError("Phase-II requires exactly five distinct fixed epoch seeds")
+    epoch_seeds = _validate_phase2_epoch_seeds(epoch_seeds)
     if not re.fullmatch(r"[0-9a-fA-F]{64}", training_retrieval_index_sha256):
         raise ValueError("training retrieval index digest must be a 64-character SHA-256")
-    musique_audit = _validate_musique_audit_manifest(musique_audit_manifest)
-
+    if not isinstance(musique_derived_manifest_path, str) or not (
+        musique_derived_manifest_path.strip()
+    ):
+        raise ValueError(
+            "Phase II requires --phase2-musique-derived-manifest from the "
+            "versioned historical source"
+        )
     pools: Dict[str, Dataset] = {}
     pool_manifest: Dict[str, Any] = {}
     for benchmark in PHASE2_BENCHMARKS:
@@ -1235,6 +1224,13 @@ def prepare_phase2_data(
             raise ValueError(
                 f"Phase-II {benchmark} pool must contain exactly {expected_pool_count:,} rows "
                 f"(Table A20); got {len(raw):,}"
+            )
+        musique_derived_manifest = None
+        if benchmark == "musique":
+            musique_derived_manifest = _validate_musique_derived_manifest(
+                raw,
+                field_map,
+                musique_derived_manifest_path,
             )
         normalized = raw.map(
             lambda row, idx: _normalize_phase2_row(
@@ -1270,6 +1266,7 @@ def prepare_phase2_data(
             "expected_count": expected_pool_count,
             "fingerprint": getattr(normalized, "_fingerprint", None),
             "augmentation_counts": augmentation_counts,
+            "derived_artifact_manifest": musique_derived_manifest,
         }
 
     candidate_order_hasher = hashlib.sha256()
@@ -1374,7 +1371,6 @@ def prepare_phase2_data(
             "corpus_scope": "page_url_deduplicated",
             "contract": "source candidate order is training-index BGE top-5 before scheduled sampling",
         },
-        "musique_human_audit": musique_audit,
         "test_url_count": len(test_urls),
         "test_url_sha256": _url_set_sha256(test_urls),
         "pool_sources": pool_manifest,
@@ -1443,7 +1439,7 @@ def prepare_evaluation_data(
         "phase": "evaluation",
         "retrieval": "full_kilt_corpus_at_evaluation_time",
         "retrieval_gold_contract": EVALUATION_GOLD_DOCUMENT_CONTRACT,
-        "answer_alias_contract": EVALUATION_ANSWER_ALIAS_CONTRACT,
+        "answer_contract": EVALUATION_ANSWER_CONTRACT,
         "splits": split_manifest,
     }
     with (output / "aria_manifest.json").open("w", encoding="utf-8") as handle:
@@ -1548,7 +1544,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare paper-faithful ARIA datasets")
     parser.add_argument(
         "--stage",
-        choices=("phase1", "phase2", "eval", "musique-partial", "all"),
+        choices=("phase1", "phase2", "eval", "all"),
         default="all",
     )
     parser.add_argument("--output-dir", "--output_dir", dest="output_dir", default="./data/aria")
@@ -1556,10 +1552,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--epoch-seeds",
         type=int,
         nargs=5,
-        default=None,
+        default=list(PAPER_PHASE2_EPOCH_SEEDS),
         metavar=("E0", "E1", "E2", "E3", "E4"),
         help=(
-            "Five distinct Phase-II sampling seeds recorded in the data manifest."
+            "Paper Phase-II epoch-view schedule: 42 123 456 789 2024. "
+            "The schedule is recorded in the data manifest."
         ),
     )
     parser.add_argument(
@@ -1572,13 +1569,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-url-config")
     parser.add_argument("--test-url-key", default="page_url")
     parser.add_argument(
-        "--musique-audit-manifest",
-        help="JSON record for the Appendix A.33 human filter and 200-example answer check",
-    )
-    parser.add_argument(
-        "--musique-decomposition-key",
-        default="question_decomposition",
-        help="Ordered 2-4-hop decomposition field used by --stage musique-partial",
+        "--phase2-musique-derived-manifest",
+        help=(
+            "Artifact-owner-supplied aria-musique-derived-source-v1 JSON "
+            "manifest for the complete 168,745-row historical derived source"
+        ),
     )
     parser.add_argument(
         "--training-retrieval-index-sha256",
@@ -1602,25 +1597,6 @@ def main() -> None:
     args = build_parser().parse_args()
     root = Path(args.output_dir)
 
-    if args.stage == "musique-partial":
-        if not args.phase2_musique_source:
-            raise ValueError(
-                "--stage musique-partial requires --phase2-musique-source"
-            )
-        prepare_musique_partial_chains(
-            SourceSpec(
-                uri=args.phase2_musique_source,
-                split=args.phase2_musique_split,
-                config=args.phase2_musique_config,
-            ),
-            str(root / "musique_partial"),
-            parent_id_key=args.phase2_musique_source_id_key,
-            question_key=args.phase2_musique_question_key,
-            answer_key=args.phase2_musique_answer_key,
-            decomposition_key=args.musique_decomposition_key,
-        )
-        return
-
     test_urls: Set[str] = set()
     if args.stage in {"phase1", "phase2", "all"}:
         test_url_specs = [
@@ -1634,24 +1610,12 @@ def main() -> None:
         prepare_phase1_data(specs, maps, str(root / "phase1"), test_urls)
 
     if args.stage in {"phase2", "all"}:
-        if args.epoch_seeds is None:
-            raise ValueError(
-                "Phase II requires five distinct values through --epoch-seeds; "
-                "training-run seeds are configured independently"
-            )
-        if not args.musique_audit_manifest:
-            raise ValueError("Phase II requires --musique-audit-manifest")
         if not args.training_retrieval_index_sha256:
             raise ValueError("Phase II requires --training-retrieval-index-sha256")
-        audit_path = Path(args.musique_audit_manifest)
-        if not audit_path.is_file():
-            raise FileNotFoundError(
-                f"MuSiQue verification manifest must be an existing file: {audit_path}"
+        if not args.phase2_musique_derived_manifest:
+            raise ValueError(
+                "Phase II requires --phase2-musique-derived-manifest"
             )
-        with audit_path.open("r", encoding="utf-8") as handle:
-            musique_audit = json.load(handle)
-        if not isinstance(musique_audit, Mapping):
-            raise ValueError("MuSiQue verification manifest must contain one JSON object")
         specs, maps = _collect_phase2_args(args)
         prepare_phase2_data(
             specs,
@@ -1659,8 +1623,8 @@ def main() -> None:
             str(root / "phase2"),
             test_urls,
             epoch_seeds=args.epoch_seeds,
-            musique_audit_manifest=musique_audit,
             training_retrieval_index_sha256=args.training_retrieval_index_sha256,
+            musique_derived_manifest_path=args.phase2_musique_derived_manifest,
         )
 
     if args.stage in {"eval", "all"}:

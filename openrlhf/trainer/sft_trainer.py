@@ -103,14 +103,6 @@ class EvaluationMetrics:
         normalized = normalized.translate(EvaluationMetrics._PUNCT_TABLE)
         return " ".join(normalized.split())
 
-    @staticmethod
-    def _gold_answers(ground_truth: Any) -> List[str]:
-        if isinstance(ground_truth, str):
-            return [ground_truth]
-        if isinstance(ground_truth, (list, tuple)):
-            return [str(value) for value in ground_truth]
-        return [str(ground_truth)]
-
     @classmethod
     def exact_match_score(cls, prediction: str, ground_truth: str) -> bool:
         """Calculate exact match score."""
@@ -119,15 +111,15 @@ class EvaluationMetrics:
         return pred_norm == gt_norm
 
     @classmethod
-    def cover_exact_match_score(cls, prediction: str, ground_truth: Any) -> bool:
-        """Appendix A.35 contains-exact-match against the best gold answer."""
-        pred_norm = cls.normalize_answer(prediction)
-        return any(
-            (gold_norm in pred_norm) if gold_norm else (pred_norm == gold_norm)
-            for gold_norm in (
-                cls.normalize_answer(gold) for gold in cls._gold_answers(ground_truth)
+    def cover_exact_match_score(cls, prediction: str, ground_truth: str) -> bool:
+        """Appendix A.35 contains-exact-match against the scalar gold answer."""
+        if not isinstance(ground_truth, str) or not ground_truth.strip():
+            raise ValueError(
+                "paper validation CEM requires one non-empty scalar answer"
             )
-        )
+        pred_norm = cls.normalize_answer(prediction)
+        gold_norm = cls.normalize_answer(ground_truth)
+        return (gold_norm in pred_norm) if gold_norm else (pred_norm == gold_norm)
 
     @classmethod
     def f1_score(cls, prediction: str, ground_truth: str) -> float:
@@ -643,9 +635,10 @@ class SFTTrainer(ABC):
                 # Generation evaluation
                 if eval_gen:
                     predictions = self._generate_predictions(batch)
-                    correct = self._calculate_accuracy(
-                        predictions, batch.get("gold_answers", batch["answers"])
-                    )
+                    # Paper validation uses the same scalar target a* as the
+                    # Phase-II supervision objective. Source aliases retained
+                    # in the training artifact never enter the reported CEM.
+                    correct = self._calculate_accuracy(predictions, batch["answers"])
                     eval_metrics["correct"] += correct
 
                 step_bar.update()
@@ -698,7 +691,13 @@ class SFTTrainer(ABC):
             return [""] * len(questions)
 
     def _calculate_accuracy(self, predictions: List[str], answers: List[str]) -> int:
-        """Calculate accuracy for predictions."""
+        """Calculate single-reference paper validation accuracy."""
+        if len(predictions) != len(answers):
+            raise ValueError("predictions and answers must have equal length")
+        if any(not isinstance(answer, str) or not answer.strip() for answer in answers):
+            raise ValueError(
+                "paper validation requires one non-empty scalar answer per row"
+            )
         correct = 0
         for pred, ans in zip(predictions, answers):
             if EvaluationMetrics.cover_exact_match_score(pred, ans):
